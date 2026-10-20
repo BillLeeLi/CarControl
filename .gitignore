@@ -1,0 +1,7 @@
+build/
+install/
+log/
+cmake-build-*/
+__pycache__/
+*.py[cod]
+*.egg-info/

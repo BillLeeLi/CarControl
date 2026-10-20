@@ -1,0 +1,17 @@
+encoder_imu_node:
+  ros__parameters:
+    port: /dev/ttyUSB0
+    baudrate: 38400
+    bytesize: 8
+    parity: 'N' # None
+    stopbits: 1
+    flowtype: 0 # deprecated
+    recvpacksize: 1
+    packhead: 0xa2
+    packtail: 0x2a
+    distancePerPulse: 0.00001117
+    MaxPulse: 30000
+    initx: 0
+    inity: 0
+    initori: 0
+    time_period : 0.02
