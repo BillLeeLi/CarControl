@@ -26,7 +26,7 @@ def draw_steering(image, steer, center, limit, label, status, target_angle):
     _text(image, f'target={target}  {status}', 205)
 
 
-def draw_laser(result, config, status, steer, speed, label):
+def draw_laser(result, config, status, steer, speed, label, command=None):
     """鸟瞰图：车头向上、车体左方在屏幕左方，与翻转后的 RGB 独立。"""
     image = np.full((800, 800, 3), 23, dtype=np.uint8)
     origin = np.array([400.0, 435.0])
@@ -93,6 +93,13 @@ def draw_laser(result, config, status, steer, speed, label):
                   f' inferred={target.inferred_ratio:.0%} score={target.score:.3f}', 144)
         elif status != 'OK':
             _text(image, 'No active target; STOP output (see status / terminal)', 120, (70, 70, 240))
+
+    if command is not None and command.diagnostics is not None:
+        diag = command.diagnostics
+        _text(image, f'v_ref={diag.target_speed_mps:.3f} / requested={diag.requested_speed_mps:.3f}'
+              f' / measured={diag.measured_speed_mps:+.3f} m/s', 168)
+        _text(image, f'speed P/I={diag.speed_p:+.1f}/{diag.speed_i:+.1f}'
+              f' steer P/D={diag.steer_p:+.1f}/{diag.steer_d:+.1f}', 192)
 
     cv2.circle(image, pixel(0, 0), round(config.radius_m * scale), (90, 150, 90), 1)
     rectangle = np.array([

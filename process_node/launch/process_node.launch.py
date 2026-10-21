@@ -1,4 +1,4 @@
-"""启动感知基线；回放时传 use_sim_time:=true。"""
+"""启动感知与运动控制节点；回放时传 use_sim_time:=true。"""
 
 import os
 

@@ -1,4 +1,4 @@
-"""统一控制接口与当前基线适配器；PD/PI 后续沿用相同输入和输出。"""
+"""统一控制接口与旧基线适配器；PD/PI 实现在 pid_controller.py。"""
 
 from dataclasses import dataclass
 import math
@@ -13,9 +13,10 @@ class ControlReference:
 
     stamp_ns: int  # 目标对应的激光消息时间，单位 ns；后续控制器以此计算 dt
     heading_error_rad: Optional[float]  # 目标相对当前车头的方向误差，左为正，单位 rad
-    target_speed_mps: Optional[float] = None  # 物理目标速度，单位 m/s；基线尚未使用
+    target_speed_mps: Optional[float] = None  # 物理目标速度（m/s）；旧基线使用 None
     stop_requested: bool = False  # 行为或保护层要求停车时优先处理
     reason: str = ''  # 本次目标或停止请求的来源说明
+    reference_id: str = 'cruise'  # 参考任务标识；改变时重置 PD 微分及 PI 积分历史
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,30 @@ class ControlInput:
 
 
 @dataclass(frozen=True)
+class ControlDiagnostics:
+    """一次闭环计算的中间量；动力项均以“正值增加前进动力”为约定。"""
+
+    dt_s: float  # 两次控制计算之间的消息时间差（s）
+    requested_speed_mps: float  # 上层请求的物理目标速度（m/s）
+    target_speed_mps: float  # 加减速限制后的内部目标速度（m/s）
+    measured_speed_mps: float  # 与激光关联的实测速度（m/s）
+    speed_error_mps: float  # 内部目标速度减实测速度（m/s）
+    heading_error_rad: float  # 相对车头的方向误差（rad），左为正
+    heading_rate_rps: float  # 滤波后的误差变化率（rad/s），不是 IMU 角速度
+    steer_p: float  # 已应用 steer_sign 的转向比例项（控制单位）
+    steer_d: float  # 已应用 steer_sign 的转向微分项（控制单位）
+    speed_feedforward: float  # 动力前馈项（控制单位）
+    speed_p: float  # 动力比例项（控制单位）
+    speed_i: float  # 动力积分项（控制单位，已经乘过 Ki）
+    steer_saturated: bool  # 转向原始输出是否超过幅值上限
+    speed_saturated: bool  # 动力原始输出是否超出 [0, speed_effort_limit]
+    steer_rate_limited: bool  # 本次转向是否受变化率限制
+    speed_rate_limited: bool  # 本次动力是否受变化率限制
+    integral_frozen: bool  # 是否因幅值/变化率限制而拒绝本次积分增量
+    derivative_reset: bool  # 是否因目标跳变或参考切换而清除微分历史
+
+
+@dataclass(frozen=True)
 class ControlCommand:
     """算法输出；由 ROS 集成层转换为课程的 Control 消息。"""
 
@@ -34,6 +59,7 @@ class ControlCommand:
     speed: int  # 底层动力控制量，不等于 m/s
     status: str  # OK、保护停止原因或接口不支持等状态
     reason: str  # 输出依据
+    diagnostics: Optional[ControlDiagnostics] = None  # 闭环中间量；旧基线/停止输出可为空
 
 
 @dataclass(frozen=True)
@@ -61,6 +87,9 @@ class BaselineController:
 
     def __init__(self, config=BaselineControlConfig()):
         self.config = config
+
+    def reset(self):
+        """旧基线无积分/微分历史，保留与闭环控制器一致的复位接口。"""
 
     def stop(self, status, reason):
         return ControlCommand(self.config.steer_center, self.config.stop_speed, status, reason)

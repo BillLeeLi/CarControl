@@ -27,7 +27,8 @@
 | `process_node/process_node/process_node.py` | 传感器订阅、`process_core`、控制发布、图像显示 |
 | `process_node/process_node/perception.py` | 无 ROS 依赖的测距处理、候选通道和直线车体扫掠检查 |
 | `process_node/process_node/motion.py` | 独立里程计位姿差分、滤波、局部运动状态和按激光时间关联 |
-| `process_node/process_node/control.py` | 统一参考/反馈/控制量接口，当前比例映射与固定动力基线适配器 |
+| `process_node/process_node/control.py` | 统一参考/反馈/控制量及诊断接口，保留旧比例映射/固定动力适配器 |
+| `process_node/process_node/pid_controller.py` | 方向 PD、前进速度 PI、斜坡、抗积分饱和、限幅与变化率限制 |
 | `process_node/process_node/visualization.py` | RGB 指示盘和激光诊断图绘制 |
 | `process_node/process_node/window_monitor.py` | 窗口关闭识别，兼容 GTK3 不支持 OpenCV 可见性属性的情况 |
 | `process_node/config/baseline.yaml`、`process_node/README.md` | 感知基线参数、运行和图例说明 |
@@ -121,7 +122,7 @@ ros2 topic echo /process_node/control
 
 播放结束后订阅节点继续等待，独立单调时钟定时器处理输入超时和窗口事件，超时输出配置的停止值。按 q、Esc、点击任一窗口关闭按钮或 Ctrl+C 可退出；无图形桌面可关闭可视化。
 
-当前实现范围为感知、独立运动反馈和统一控制接口基线：保守处理未知、短缺口补齐、前向通道和直线车体包络检查，独立反馈包含有符号速度、航向、局部位置和行程。`ControlInput` 将目标及关联反馈交给基线控制器，方向仍是比例映射，检查通过时动力值固定，物理目标速度为 None。默认 `require_motion_feedback=true`，反馈缺失、失效、超时或不能对齐时停止；false 只供离线感知观察。90°转弯行为、S 弯行为、终点判断和 PD/PI 尚待后续实现。默认几何参数和控制值只供离线调试，实车需标定。
+当前实现包含感知、独立运动反馈和方向 PD/前进速度 PI。默认 `control_mode=closed_loop`、`reference_mode=perception`、`target_speed_mps=0.2`，`ControlInput` 将局部目标及关联反馈交给控制器；包含目标速度斜坡、积分限幅/条件积分抗饱和、输出限幅和变化率限制。首个有效输入 `CONTROL_WARMUP` 保持停止，下一消息建立有效 dt 后运行。反馈失效、超时、时间异常、无通道或零目标速度直接停止并重置控制历史，停止覆盖普通平滑逻辑。闭环强制要求有效反馈；仅在 `control_mode=baseline` 下可关闭 `require_motion_feedback` 供离线对照。`reference_mode=straight` 仅接受合格的 0°候选，用于转向中位/速度 PI 测试，不锁定全局航向。控制符号、动力前馈及增益尚未实车标定；控制参数启动时读取，修改后需重启。90°转弯、S 弯、终点、走廊中线和实际弯曲路径检查仍待实现，不能用录制回放证明实车稳定性。
 
 ## 实车运行与录制
 

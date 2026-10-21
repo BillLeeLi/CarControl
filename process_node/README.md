@@ -1,6 +1,6 @@
-# 感知、运动反馈与控制接口基线
+# 激光方向跟踪与低速 PD/PI 控制
 
-本阶段实现测距分类、真实角度转换、局部候选通道选择、独立里程计反馈和统一控制接口。`process_core(urg)` 仍返回 `(steer, speed)`。尚未实现 90°转弯行为、S 弯行为、终点判断、方向 PD 或速度 PI；当前转向仍为比例映射，感知和反馈检查通过时使用固定动力值。跨设备迁移见 [MIGRATION.md](MIGRATION.md)。
+本阶段实现激光局部方向选择、独立里程计反馈、方向 PD 和前进速度 PI。`process_core(urg)` 仍返回 `(steer, speed)`。默认 `control_mode=closed_loop`，请求速度为 0.2 m/s；所有增益、控制符号和前馈参数仍是离线起点，尚未实车整定。90°转弯、S 弯、终点判断、走廊中线跟踪和实际转弯路径检查仍待实现。跨设备迁移见 [MIGRATION.md](MIGRATION.md)。
 
 **新增行为：默认必须收到有效的独立 `/encoder_imu_node/odom`，且它与激光消息时间接近，才允许输出行驶指令。** 当前课程 bag 已包含该话题，完整回放命令不变。只有激光数据时，会输出停止值。
 
@@ -21,7 +21,7 @@
                                                    ↓ 按激光消息时间关联
 AllSensor.urg → analyze_scan → ControlReference + MotionFeedback
                                       ↓ ControlInput
-                               BaselineController
+                               PIDController（默认）
                                       ↓ ControlCommand
                                ROS Control 消息
 ```
@@ -42,7 +42,40 @@ AllSensor.urg → analyze_scan → ControlReference + MotionFeedback
 | `ControlInput` | 参考目标和已检查有效性/时间关联的运动反馈 |
 | `ControlCommand` | 底层 steer/speed 控制量、状态及输出原因 |
 
-当前 `target_speed_mps=None` 表示物理目标速度尚未启用。基线控制器仍使用 `cruise_speed` 动力值，反馈只参与有效性检查；**接上里程计不等于已经实现速度闭环**。如果向基线请求物理目标速度，它会停止并报告 `UNSUPPORTED_REFERENCE`，避免悄悄忽略这个字段。后续 PD/PI 将沿用接口，实现误差与时间历史处理。
+默认模式将物理目标速度填入 `ControlReference.target_speed_mps`，`pid_controller.py` 实现方向 PD 与速度 PI。`control_mode=baseline` 保留旧比例转向/固定动力输出供离线对照，此时目标速度字段仍为 None，`target_speed_mps` 参数不控制旧基线的动力值。
+
+## 控制器如何工作
+
+**方向 PD** 的误差是当前目标方向相对车头的角度（rad）。当前没有额外计算走廊横向位置误差：
+
+```text
+转向偏移 = steer_sign × (steer_kp × 方向误差 + steer_kd × 滤波后的误差变化率)
+steer = steer_center + 经过限幅、变化率限制的转向偏移
+```
+
+误差微分使用控制消息时间差，一阶低通默认 0.15 秒。相邻误差跳变超过 20°，或 `ControlReference.reference_id` 改变时，D 项清零，随后重新计算；P 项仍受输出变化率限制。这里的误差变化率不是 IMU 角速度。
+
+**速度 PI** 使用 `motion.py` 的有符号滤波速度（m/s）：
+
+```text
+内部目标速度：从零按 target_accel_mps2 逐步接近请求速度
+速度误差 = 内部目标速度 - 实测前进速度
+前进动力幅度 = 前馈偏置 + 前馈系数 × 内部目标速度 + Kp × 误差 + 积分项
+speed = stop_speed + speed_sign × 经过限幅、变化率限制的前进动力幅度
+```
+
+本版只支持非负目标速度，动力幅度限制在 `[0, speed_effort_limit]`。超速时可降低动力至停止值，**不会自动发送倒车动力充当制动**。机械制动效果仍取决于底层对停止值的定义。积分项有独立限幅，并采用条件积分：若输出幅值或变化率受限，拒绝会继续加重限制的积分增量，允许反方向积分帮助恢复。
+
+控制时间来自相邻 `urg.header.stamp`，不假设固定帧率。首个有效输入保持停止并报告 `CONTROL_WARMUP`，下一次足够间隔的消息才计算输出。过短间隔累计后计算；重复/回跳时间或过长间隔停止并清空历史。传感器失效、超时、无可行目标、零速请求及退出时，停止输出绕过普通平滑限制，清空积分、微分和内部目标速度。恢复后重新预热，不延续旧动力。参考任务切换清除 I/D 历史，正常输出仍受变化率限制。
+
+两个参考模式可用于分阶段测试：
+
+| `reference_mode` | 行为 |
+|---|---|
+| `perception`（默认） | 跟踪当前感知选出的目标方向，运行方向 PD 和速度 PI |
+| `straight` | 仅接受感知检查合格的 0° 候选，没有则 `NO_STRAIGHT_PATH` 停车；方向误差为零，用于中位和速度 PI 的直路测试 |
+
+`straight` 不锁定初始全局航向，也不计算走廊中线误差；若车辆因中位偏差逐渐偏航，它不会根据绝对航向纠偏。测试方向 PD 时使用 `perception`。两种模式均不能证明现有直线包络对应实际车辆转弯轨迹。
 
 ## 构建与运行
 
@@ -71,15 +104,47 @@ ros2 run process_node process_node --ros-args -r __ns:=/process_node \
 
 纯终端运行时给 launch 加 `show_visualization:=false`，或给 `ros2 run` 加 `-p show_visualization:=false`。没有图形桌面时程序也会自动关闭显示。主入口与其他已有包的接口保持兼容。
 
+仅测试中位和低速前进 PI，可在加载环境后运行（离线回放用 true，实车用 false）：
+
+```bash
+ros2 run process_node process_node --ros-args -r __ns:=/process_node \
+  --params-file ~/ros2_ws/src/process_node/config/baseline.yaml \
+  -p use_sim_time:=true -p reference_mode:=straight -p target_speed_mps:=0.15
+```
+
+实际参数集中写入专用 YAML 后，可继续使用 `ros2 launch ... config:=/绝对路径/参数.yaml`。当前 launch 仅提供 `config`、`use_sim_time`、`show_visualization` 三个启动参数；控制模式和增益通过 YAML 或 `ros2 run` 的 ROS 参数传递。参数在启动时读取，修改后重新启动节点。
+
 仅需查看激光感知、输入又不含独立里程计时，可以显式关闭反馈门控：
 
 ```bash
 ros2 run process_node process_node --ros-args -r __ns:=/process_node \
   --params-file ~/ros2_ws/src/process_node/config/baseline.yaml \
-  -p use_sim_time:=true -p require_motion_feedback:=false
+  -p use_sim_time:=true -p control_mode:=baseline -p require_motion_feedback:=false
 ```
 
-此开关只供离线观察；它仍会发布当前基线的控制消息，不应连接实车驱动使用。使用 launch 时通过单独的 YAML 配置该参数；当前 launch 没有同名启动参数。
+此组合只供离线观察；它仍会发布旧基线控制消息，不应连接实车驱动使用。闭环模式不允许关闭反馈检查，启动时会拒绝该配置。
+
+## 有终端输出但没有图形窗口
+
+窗口需要同时满足 `show_visualization=true` 和启动进程具有有效的桌面显示环境。VS Code、SSH 或新开的容器终端可能没有继承桌面的 `DISPLAY`；即使容器桌面正在运行，程序也会关闭可视化，并在启动日志中明确提示缺少 `DISPLAY/WAYLAND_DISPLAY`。这与控制器是否获得反馈、是否输出行驶指令无关；等待输入或停车时也应显示窗口。
+
+在启动节点的终端检查：
+
+```bash
+echo "$DISPLAY"
+```
+
+通过 VS Code 连接容器、窗口由其显示转发到本机时，应使用 VS Code 自动提供的显示环境。VS Code 更新、重启或重新连接后，若转发异常，优先重新连接容器并新开终端；必要时重启容器，再按原命令运行：
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+ros2 launch process_node process_node.launch.py use_sim_time:=true show_visualization:=true
+```
+
+显示编号可能随连接改变，不要将 `DISPLAY` 或 `XAUTHORITY` 固定写入 `~/.bashrc`，也不要用容器 VNC 的 `:1` 覆盖 VS Code 的本机转发地址。程序只读取这些变量，不会修改它们。若出现“窗口显示失败”而非“缺少显示环境”，应按日志核对显示连接、授权和 OpenCV GUI 依赖。
+
+2026-10-21 窗口问题的记录：异常启动进程缺少显示环境变量；在容器 VNC `:1` 中进行的隔离检查确认 GTK 绘图和关闭处理可用，但该桌面不等于用户本机的显示转发目标。用户重启容器后，原启动命令恢复正常，无需手动 export；随后检查到当前会话自动提供了 `DISPLAY=:19`。此编号仅为当次观察，不作为配置值。
 
 ## 如何读图和日志
 
@@ -91,6 +156,8 @@ ros2 run process_node process_node --ros-args -r __ns:=/process_node \
 - `WAITING` 表示尚未收到数据，`STALE_DATA` 表示超过输入超时。暂停/播完后会显示缓存的末帧并撤去活动目标，独立定时器继续处理窗口事件。
 - `odom=OK` 表示反馈可用；`WAITING_ODOM`/`INITIALIZING_ODOM` 表示等待输入或差分起点尚未就绪；`STALE_ODOM` 表示有效估计接收超时；`UNALIGNED_ODOM` 表示反馈与激光时间差过大；`INVALID_ODOM`、`DUPLICATE_ODOM`、`ODOM_TIME_REWIND`、`ODOM_TIME_GAP`、`ODOM_POSE_JUMP` 分别标记输入或差分连续性问题。默认门控开启时，不可用反馈会阻止行驶，定时器也会独立检测反馈超时。
 - 新日志 `v/raw_v` 为滤波/原始物理速度（m/s），`yaw/turn` 为当前/累计航向（度），`travel/signed` 为累计路程/有符号行程（m），`local` 为局部位置（m），`dt` 为差分间隔，`skew` 为关联反馈时间减激光时间（s）。反馈无效时仍可能显示缓存值，但它们仅供诊断，不能用于控制。
+- 闭环日志增加 `v_ref`（斜坡后目标）、`requested`（请求目标）、`v_used`（本次控制使用的关联速度）、`e_v`、动力 `[FF,P,I]`、转向 `[P,D]`、`control_dt`，以及幅值饱和 `sat`、变化率限制 `rate`、冻结积分 `I_frozen` 和撤去微分 `D_reset` 标记。激光图也显示目标/反馈速度及 P/I/D 项。
+- `CONTROL_WARMUP` 为有效输入恢复后的首帧等待；`CONTROL_TIME_INVALID`/`CONTROL_TIME_GAP` 为控制时间不连续；`STOP_REQUESTED` 包括零目标速度。这些状态均停止。录制数据中车辆速度不受本次输出影响，实测速度高于斜坡目标时动力输出为停止值是可能的，不能据此判断实车调速效果。
 - 按 q、Esc 或关闭任一窗口会发送停止值并退出节点，Ctrl+C 也可退出。输入超时还会周期性发送停止值；这些值的物理效果仍须在实车上确认。
 
 ## 主要参数
@@ -108,9 +175,20 @@ ros2 run process_node process_node --ros-args -r __ns:=/process_node \
 | `max_interpolate_gap_deg`、`interpolate_range_jump_m` | 允许补齐的最长短缺口及两端最大距离差；前者设 0 可禁用补齐 |
 | `max_inferred_ratio` | 选中窗口内补齐分箱的最高比例 |
 | `forward_weight`、`continuity_weight` | 前行倾向和目标连续性的评分权重 |
-| `steer_center`、`steer_limit`、`steer_gain_per_rad` | 转向中位、相对中位的最大幅值、每弧度控制增益；与真实车轮角无直接等价关系 |
-| `cruise_speed`、`stop_speed` | 有候选时的固定动力值、停止动力值，不是 m/s |
-| `require_motion_feedback` | 默认 true；要求独立反馈有效且与激光时间接近 |
+| `control_mode` | 默认 closed_loop；baseline 用于旧固定动力基线对照 |
+| `reference_mode`、`target_speed_mps` | perception/straight；请求的非负物理目标速度，默认 0.2 m/s，0 直接停车 |
+| `steer_center`、`steer_limit`、`stop_speed` | 转向中位、偏移幅度上限、停止动力值，均为底层控制单位 |
+| `steer_sign`、`steer_kp`、`steer_kd` | 转向符号 ±1、P/D 增益；误差用 rad，时间用 s |
+| `steer_derivative_tau_s`、`steer_jump_reset_deg` | 微分低通时间常数/相邻误差跳变撤去 D 项的角度阈值 |
+| `steer_rate_limit`、`speed_rate_limit` | 转向/动力控制量每秒最大正常变化量；内部保留浮点数，发布时四舍五入 |
+| `speed_sign`、`speed_kp`、`speed_ki` | 前进动力符号 ±1、速度 P/I 增益；误差用 m/s，时间用 s |
+| `speed_feedforward_gain`、`speed_feedforward_offset` | 动力线性前馈系数/偏置；必须实测，不能由当前无控制输出的 bag 拟合 |
+| `speed_effort_limit`、`speed_integral_limit` | 前进动力幅度上限/积分项绝对上限，单位均为底层控制单位 |
+| `target_accel_mps2`、`target_decel_mps2` | 内部目标速度的正常加/减速上限，m/s²；请求零速仍直接停止 |
+| `max_target_speed_mps` | 接口允许的最高物理目标速度，默认 0.5 m/s，超范围拒绝运行 |
+| `control_min_dt_s`、`control_max_dt_s` | 控制消息计算间隔，默认 0.01/0.5 秒 |
+| `steer_gain_per_rad`、`cruise_speed` | 仅 baseline 模式使用的比例转向增益和固定动力值 |
+| `require_motion_feedback` | 默认 true；closed_loop 强制开启，baseline 可关闭供离线观察 |
 | `odom_topic` | 独立里程计输入话题，默认 `/encoder_imu_node/odom` |
 | `odom_frame_id`、`odom_child_frame_id` | 预期坐标系，默认 `odom`、`base_link`；不执行坐标变换 |
 | `odom_min_dt_s`、`odom_max_dt_s` | 差分允许的最短/最长消息间隔，默认 0.01/0.5 秒 |
@@ -128,6 +206,7 @@ ros2 run process_node process_node --ros-args -r __ns:=/process_node \
 ```bash
 python3 -m pytest src/process_node/test/test_perception.py \
   src/process_node/test/test_motion.py src/process_node/test/test_control.py \
+  src/process_node/test/test_pid_controller.py src/process_node/test/test_node_closed_loop.py \
   src/process_node/test/test_node_baseline.py src/process_node/test/test_window_monitor.py -q
 ```
 
@@ -141,7 +220,13 @@ python3 -m pytest src/process_node/test/test_perception.py \
 
 在隔离 ROS 域 222、命名空间 `/interface_test` 中，通过真实 ROS 发布/订阅输入约 120 秒片段：只有 AllSensor 时保持 `WAITING_ODOM` 和停止输出；加入独立里程计后得到 `(212, -100)`，关联差约 −2.58 ms；继续发送激光但停止里程计后进入 `STALE_ODOM`，输出 `(0, 0)`。整个检查中模拟时钟保持 0，验证反馈超时不依赖 `/clock` 前进。
 
-本阶段在课程容器中选择性构建 `process_node` 成功，上述五个测试文件合计 77 项通过。尚未在实车或助教设备上核验反馈精度与控制响应。
+反馈接口阶段在课程容器中构建成功，五个测试文件合计 77 项通过；上述 `(212, -100)` 是旧基线输出。当前 PD/PI 的输出由消息序列、斜坡和速度误差共同决定，不再是固定动力。尚未在实车或助教设备上核验反馈精度与控制响应。
+
+PD/PI 阶段在课程容器中构建成功，上述七个测试文件合计 **115 项通过**。新增检查包括 P/D 和 P/I 数值、消息时间、微分滤波、目标跳变、参考切换、积分和输出饱和、变化率限制、停车与恢复。一个明确假设的一阶速度/转向模型用于检查负反馈方向和数值收敛，它不是课程车辆动力学模型，不能用于实车整定。
+
+另外在隔离 ROS 域 224、命名空间 `/pid_test` 中加载安装后的 `baseline.yaml`，按时间索引读取约 120–121 秒的 12 帧 `/scan` 和 50 条独立里程计（共 196,912 字节）；将真实扫描填入 AllSensor.urg，经 ROS 发布/订阅输入节点。观察到等待反馈、首帧预热及 10 次正常计算，末次输出 `(220, -16)`，内部目标约 0.167 m/s、关联测量约 0.325 m/s。随后停止输入，反馈超时输出停止值；恢复后首帧预热，下一帧内部目标重新从 0.02 m/s 开始。模拟时钟全程为 0，独立超时仍有效。这是消息链路及控制计算检查，不是车辆已响应这些指令的证据。
+
+上机调试顺序建议：先在手动模式核验控制符号、中位、停止值、速度单位与反馈；测定前进动力死区及粗略前馈关系；再在空旷直路低速测试 PI，逐步调 Kp/Ki；随后以小方向误差测试方向 P，再加入 D。若不动，先核对前馈和死区，不应仅靠增大积分强行启动。每次保存参数版本并录制传感器、独立里程计和控制输出。
 
 窗口兼容性：课程镜像使用的 OpenCV 4.5 GTK3 后端，在窗口正常打开时，`WND_PROP_VISIBLE` 也可能返回 −1，不能将它直接理解成“用户关闭了窗口”。`window_monitor.py` 对 GTK3 使用原生窗口列表（`python3-gi`）识别关闭，其他后端先确认窗口已出现，再判断关闭；不支持查询且缺少原生绑定时，不因未知返回值退出，仍可用 q/Esc、Ctrl+C 退出。
 

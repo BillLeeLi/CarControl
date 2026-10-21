@@ -63,6 +63,7 @@ tar -xzf /tmp/process_node_transfer.tar.gz
     ├── perception.py
     ├── motion.py
     ├── control.py
+    ├── pid_controller.py
     ├── visualization.py
     └── window_monitor.py
 ```
@@ -113,6 +114,7 @@ python3 -c "import rclpy, numpy, cv2, cv_bridge; from nav_msgs.msg import Odomet
 ```bash
 python3 -m pytest src/process_node/test/test_perception.py \
   src/process_node/test/test_motion.py src/process_node/test/test_control.py \
+  src/process_node/test/test_pid_controller.py src/process_node/test/test_node_closed_loop.py \
   src/process_node/test/test_node_baseline.py \
   src/process_node/test/test_window_monitor.py -q
 ```
@@ -143,6 +145,8 @@ ros2 launch process_node process_node.launch.py \
     use_sim_time:=false show_visualization:=false
 ```
 
+如果桌面存在但两个窗口都不出现，检查启动终端的 `echo "$DISPLAY"` 和启动日志。程序要求 `show_visualization=true` 且进程有有效显示连接。使用 VS Code 容器显示转发时，环境由 VS Code 自动提供；更新或重连后异常，优先重新连接并新开终端，必要时重启容器。2026-10-21 用户重启容器后已恢复，无需手动 export。不要将容器 VNC 的 `:1` 当成本机转发目标，也不要把临时显示编号或授权路径固定写入 `~/.bashrc`。助教设备使用其实际桌面/转发环境；详细记录见 README 的“有终端输出但没有图形窗口”。
+
 | 场景 | `use_sim_time` | 输入来源 |
 |---|---|---|
 | 实车 | `false` | 实时传感器及同步节点，无需 `ros2 bag play` |
@@ -164,16 +168,21 @@ ros2 topic info /process_node/control --verbose
 
 **当前默认要求独立里程计反馈有效**：话题通过 `odom_topic` 配置，坐标系默认 `odom` → `base_link`（对应 `odom_frame_id`、`odom_child_frame_id`，本节点不做 TF 变换）。节点用位置/姿态和消息时间估计速度与航向，不使用底层有问题的 `twist.linear`。需至少两个有效位姿，默认差分间隔 0.01–0.5 秒、有效反馈接收超时 0.5 秒、与激光关联时间差不超过 0.15 秒。缺失、异常、超时或不能对齐的反馈均会输出停止值；从日志 `odom`、`v/raw_v`、`dt`、`skew` 检查具体原因。
 
-时间阈值、滤波和跳变检查参数见 `config/baseline.yaml` 及 README。`require_motion_feedback=false` 仅供离线查看感知，不用于实车绕过反馈检查；完整 bag 回放需保留独立里程计话题。当前标签为 `midterm-feedback-v1`。
+时间阈值、滤波和跳变检查参数见 `config/baseline.yaml` 及 README；完整 bag 回放需保留独立里程计话题。
+
+当前版本标签为 `midterm-pd-pi-v1`，默认 `control_mode=closed_loop`，执行方向 PD 与速度 PI，物理请求速度 `target_speed_mps=0.2`。首个有效控制输入保持停止并建立时间基准，下一帧开始计算。停止、传感器/反馈失效或时间异常会清空控制器历史。闭环模式强制要求有效反馈；仅离线观察激光时需同时设置 `control_mode=baseline`、`require_motion_feedback=false`，仍不能连接实车驱动使用。
+
+首次直路测试可在专用配置中设置 `reference_mode=straight` 和较低的 `target_speed_mps`。straight 只接受合格的 0°候选，用于中位/速度 PI 测试，不锁定全局航向；perception 模式才跟踪感知目标方向。可用 `ros2 run` 的 ROS 参数覆盖，具体命令见 README。launch 的启动参数仍是 config、use_sim_time、show_visualization，其他参数通过 YAML 配置。
 
 现场按实际车辆核对以下配置：
 
 - 雷达安装偏角、车宽、雷达到车体前后端的距离及安全裕量。
 - 里程计坐标系和消息时间；低速前进的 `v` 应为正、倒退为负，静止应接近零，航向及位置尺度需核验。
 - 转向中位、正负方向、幅度、增益，以及动力值和停止值；`steer` 和 `speed` 均是底层控制量，不直接等于转角和 m/s。
+- `steer_sign`、`speed_sign`、前进动力死区和前馈系数/偏置，随后标定 PD/PI 增益；`speed_effort_limit`、变化率限制和物理目标速度上限需适配具体车辆。默认增益没有实车验证。
 - 控制话题与底层驱动一致；切换自动前由助教确认车辆状态，临近碰撞立即切回手动。
 
-当前实现为感知、独立运动反馈与统一控制接口基线：反馈有效性参与门控，转向使用比例映射，检查通过时动力值固定。物理目标速度尚未启用，反馈尚未用于 PI 调节；90°转弯行为、S 弯行为、终点判断及 PD/PI 尚未实现。默认参数供离线调试，不能因编译成功就视为已完成整车控制标定。
+当前已实现激光目标方向 PD、前进速度 PI、目标速度斜坡、限幅、变化率限制及条件积分抗饱和；零速和保护停止直接覆盖普通输出。动力仅支持前进幅度，不自动倒车制动。90°转弯行为、S 弯行为、终点判断、走廊中线跟踪和实际弯曲轨迹检查尚未实现。默认参数供离线调试，不能因编译成功就视为已完成整车控制标定。
 
 ## 7. 常见问题
 
@@ -187,7 +196,11 @@ ros2 topic info /process_node/control --verbose
 | `WAITING_ODOM`/`INITIALIZING_ODOM` | 检查独立里程计话题和足够间隔的有效位姿；AllSensor 内的里程计不能替代它 |
 | `STALE_ODOM`/`UNALIGNED_ODOM` | 检查反馈接收、消息时间源及与激光的时间差；实车使用 `use_sim_time=false` |
 | `INVALID_ODOM`/`ODOM_POSE_JUMP` | 查看日志原因，核对坐标系、姿态、位置尺度和运动上限参数 |
+| `CONTROL_WARMUP` | 等待下一次有效控制消息；若一直出现，检查是否反复触发保护或时间异常 |
+| `CONTROL_TIME_INVALID`/`CONTROL_TIME_GAP` | 检查激光时间戳是否重复、回跳或间隔过长；控制器已停止并清空历史 |
+| `NO_STRAIGHT_PATH` | straight 测试没有合格的 0°候选；不应通过强制前进绕过感知检查 |
+| PI 输出较小、车辆不启动 | 核对控制符号、前馈和起动死区；增益、积分上限和斜坡见 README，不盲目加大积分 |
 | 有输出但底层收不到 | 检查是否发布到了 `/control`；优先使用本文 launch，核对 `/process_node/control` 的端点 |
-| 无桌面或窗口无法打开 | 使用 `show_visualization:=false`；有桌面时检查显示环境和 GUI 依赖 |
+| 有输出但窗口都不出现 | 检查 show_visualization 与 DISPLAY；VS Code 更新/重连后可重新连接或重启容器恢复转发，勿写死显示地址 |
 
-本文步骤依据当前仓库配置整理。当前版本已在本机课程容器中构建成功、通过 77 项感知/反馈/控制接口与集成测试，并验证真实 ROS 发布/订阅及反馈超时停车；尚未在助教设备上验证。首次迁移后应记录实际工作区、依赖差异及可用的整车启动方式，并据此更新本文。
+本文步骤依据当前仓库配置整理。当前 PD/PI 版本已在本机课程容器中构建成功、通过 115 项感知/反馈/控制器与集成测试，并用约 1 秒真实雷达/里程计数据验证 ROS 发布/订阅、预热、控制计算、反馈超时停车及恢复复位；尚未在助教设备或实车验证。新增 `pid_controller.py` 随整个包一起安装，本阶段没有新增第三方运行依赖。首次迁移后应记录实际工作区、依赖差异及可用的整车启动方式，并据此更新本文。

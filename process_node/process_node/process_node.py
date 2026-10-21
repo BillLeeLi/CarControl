@@ -1,6 +1,6 @@
-"""激光感知、独立运动反馈和控制接口；当前执行器仍使用比例映射基线。"""
+"""激光目标方向跟踪、独立运动反馈、方向 PD 与低速前进 PI。"""
 
-from dataclasses import fields
+from dataclasses import fields, replace
 import math
 import os
 import signal
@@ -21,6 +21,7 @@ from process_node.control import (
     BaselineControlConfig, BaselineController, ControlInput, ControlReference,
 )
 from process_node.motion import MotionConfig, MotionEstimator
+from process_node.pid_controller import PIDConfig, PIDController
 from process_node.perception import PlannerConfig, analyze_scan
 from process_node.visualization import draw_laser, draw_steering
 from process_node.window_monitor import create_window_monitor
@@ -44,14 +45,38 @@ class LaserWindowAnalyzer(Node):
             }
         )
         self.declare_parameter("sensorTopic", "/sync_store_node/allsensor")
-        self.declare_parameter("group_label", "midterm-feedback-v1")
+        self.declare_parameter("group_label", "midterm-pd-pi-v1")
         self.declare_parameter("show_visualization", True)
+        self.declare_parameter("control_mode", "closed_loop")
+        self.declare_parameter("reference_mode", "perception")
+        self.declare_parameter("target_speed_mps", 0.2)
+        self.control_mode = self.get_parameter("control_mode").value
+        self.reference_mode = self.get_parameter("reference_mode").value
+        self.target_speed_mps = self.get_parameter("target_speed_mps").value
         control_defaults = BaselineControlConfig()
         for item in fields(control_defaults):
             self.declare_parameter(item.name, getattr(control_defaults, item.name))
-        self.controller = BaselineController(BaselineControlConfig(**{
+        baseline_config = BaselineControlConfig(**{
             item.name: self.get_parameter(item.name).value for item in fields(control_defaults)
-        }))
+        })
+        pid_defaults = PIDConfig()
+        for item in fields(pid_defaults):
+            if not self.has_parameter(item.name):
+                self.declare_parameter(item.name, getattr(pid_defaults, item.name))
+        pid_config = PIDConfig(**{
+            item.name: self.get_parameter(item.name).value for item in fields(pid_defaults)
+        })
+        if self.control_mode not in ('closed_loop', 'baseline'):
+            raise ValueError('control_mode 必须为 closed_loop 或 baseline')
+        if self.reference_mode not in ('perception', 'straight'):
+            raise ValueError('reference_mode 必须为 perception 或 straight')
+        if (not math.isfinite(self.target_speed_mps)
+                or not 0 <= self.target_speed_mps <= pid_config.max_target_speed_mps):
+            raise ValueError('target_speed_mps 必须在 [0, max_target_speed_mps] 内')
+        if self.control_mode == 'closed_loop' and not baseline_config.require_motion_feedback:
+            raise ValueError('closed_loop 必须开启 require_motion_feedback；离线感知观察请选 baseline')
+        self.controller = PIDController(pid_config) if self.control_mode == 'closed_loop' \
+            else BaselineController(baseline_config)
         self.declare_parameter("odom_topic", "/encoder_imu_node/odom")
         motion_defaults = MotionConfig()
         for item in fields(motion_defaults):
@@ -66,7 +91,7 @@ class LaserWindowAnalyzer(Node):
         self.steer_limit = self.get_parameter("steer_limit").value
         self.cruise_speed = self.get_parameter("cruise_speed").value
         self.stop_speed = self.get_parameter("stop_speed").value
-        self.require_motion_feedback = self.controller.config.require_motion_feedback
+        self.require_motion_feedback = baseline_config.require_motion_feedback
         self.timeout = self.get_parameter("sensor_timeout_s").value
         self.log_period = self.get_parameter("log_period_s").value
         if (
@@ -111,17 +136,22 @@ class LaserWindowAnalyzer(Node):
         if self.gui and not (
             os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
         ):
-            self.get_logger().warning("没有图形桌面，自动关闭窗口；可继续观察终端输出")
+            self.get_logger().warning(
+                "show_visualization=true，但当前进程未设置 DISPLAY/WAYLAND_DISPLAY，"
+                "自动关闭窗口。若容器已有桌面，请从桌面终端启动，或设置该桌面的 "
+                "DISPLAY 后重启节点；仅设置 show_visualization=true 不会补齐显示环境。"
+            )
             self.gui = False
 
         # 独立的单调时钟定时器：bag 播完或暂停后，仍处理窗口事件及输入超时。
         self.steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.ui_timer = self.create_timer(0.05, self._tick, clock=self.steady_clock)
         self.get_logger().info(
-            f"[{self.label}] 感知与运动反馈基线；control={self.publisher_.topic_name}，"
+            f"[{self.label}] control_mode={self.control_mode}，reference_mode={self.reference_mode}；"
+            f"control={self.publisher_.topic_name}，"
             f"odom={self.odometry_subscription.topic_name}，"
             f"require_motion_feedback={self.require_motion_feedback}。"
-            "尚未启用 PD/PI；尺寸、停止值和转向映射上车前需标定。"
+            "尺寸、控制符号、停止值、前馈和控制增益上车前需标定。"
         )
 
     def _publish(self, steer, speed):
@@ -145,6 +175,7 @@ class LaserWindowAnalyzer(Node):
         self.motion.update(msg, received_at=now)
         if self.motion.generation != generation:
             self.previous_target = None
+            self.controller.reset()
         sensor_fresh = self.last_received is not None and now - self.last_received <= self.timeout
         # 与激光回调/定时器使用同一种关联结果，避免日志在“最新里程计有效”
         # 和“关联到本帧激光的反馈无效”之间反复切换。
@@ -183,6 +214,7 @@ class LaserWindowAnalyzer(Node):
                 self.steer_value,
                 self.speed_value,
                 self.label,
+                command=self.last_command,
             )
 
     def _log_decision(self):
@@ -210,10 +242,28 @@ class LaserWindowAnalyzer(Node):
             motion_text += f" skew={feedback.skew_s:+.3f}s"
         if not feedback.valid:
             motion_text += f" ({feedback.reason}；数值如有显示，仅供诊断)"
+        control_text = f"controller={self.control_mode}: {self.last_command.reason}"
+        diagnostics = self.last_command.diagnostics
+        if diagnostics is not None:
+            control_text += (
+                f" | v_ref={diagnostics.target_speed_mps:.3f}m/s"
+                f" requested={diagnostics.requested_speed_mps:.3f}m/s"
+                f" v_used={diagnostics.measured_speed_mps:+.3f}m/s"
+                f" e_v={diagnostics.speed_error_mps:+.3f}m/s"
+                f" speed[FF,P,I]=({diagnostics.speed_feedforward:.2f},"
+                f"{diagnostics.speed_p:.2f},{diagnostics.speed_i:.2f})"
+                f" steer[P,D]=({diagnostics.steer_p:.2f},{diagnostics.steer_d:.2f})"
+                f" control_dt={diagnostics.dt_s:.3f}s"
+                f" sat[steer,speed]=({diagnostics.steer_saturated},{diagnostics.speed_saturated})"
+                f" rate[steer,speed]=({diagnostics.steer_rate_limited},"
+                f"{diagnostics.speed_rate_limited}) I_frozen={diagnostics.integral_frozen}"
+                f" D_reset={diagnostics.derivative_reset}"
+            )
         result = self.last_plan
         if result is None or self.status == "STALE_DATA":
             self.get_logger().info(
                 f"[{self.label}] {self.status}：等待有效传感器输入，输出停止值 | {motion_text}"
+                f" | {control_text}"
             )
             return
         data = result.scan
@@ -236,6 +286,7 @@ class LaserWindowAnalyzer(Node):
             f" gaps={len(result.gaps)} candidates={len(result.candidates)}"
             f" | steer={self.steer_value} speed={self.speed_value} | {motion_text}"
             f" | perception={result.status}: {result.reason}"
+            f" | {control_text}"
         )
 
     def _tick(self):
@@ -298,6 +349,7 @@ class LaserWindowAnalyzer(Node):
                     self.steer_value,
                     self.speed_value,
                     self.label,
+                    command=self.last_command,
                 )
             cv2.imshow(self.LASER_WINDOW, laser)
             if cv2.waitKey(1) & 0xFF in (27, ord("q")):
@@ -323,26 +375,37 @@ class LaserWindowAnalyzer(Node):
         stamp_ns = stamp.sec * 10**9 + stamp.nanosec
         if self.last_stamp_ns is not None and stamp_ns < self.last_stamp_ns:
             self.previous_target = None
+            self.controller.reset()
             # 新一轮 odom 可能先于激光到达，只有仍留着旧时间段的反馈时才清空。
             if (self.motion.state is not None and self.motion.state.stamp_ns
                     > stamp_ns + round(self.motion.config.scan_tolerance_s * 1e9)):
                 self.motion.reset('ODOM_TIME_REWIND', '激光时间回跳，等待同一时间段的新反馈')
         self.last_stamp_ns = stamp_ns
         self.last_plan = analyze_scan(urg, self.config, self.previous_target)
+        if self.reference_mode == 'straight' and self.last_plan.target is not None:
+            # 直路测试只接受通过了原有观测及车体检查的 0° 候选，不强行向前。
+            straight = next((item for item in self.last_plan.candidates
+                             if abs(item.angle) < 1e-9), None)
+            self.last_plan = replace(
+                self.last_plan, target=straight,
+                status='OK' if straight is not None else 'NO_STRAIGHT_PATH',
+                reason='直路测试：正前方候选检查通过' if straight is not None
+                else '直路测试：正前方没有合格候选，停止而不选择侧向通道',
+            )
         target = self.last_plan.target
         self.last_feedback = self.motion.feedback(stamp_ns)
         reference = ControlReference(
             stamp_ns=stamp_ns,
             heading_error_rad=None if target is None else target.angle,
-            # None 明确表示本阶段没有物理目标速度，不能把 cruise_speed 当 m/s。
-            target_speed_mps=None,
+            target_speed_mps=self.target_speed_mps if self.control_mode == 'closed_loop' else None,
             stop_requested=target is None,
             reason=self.last_plan.reason,
+            reference_id=self.reference_mode,
         )
         self.last_control_input = ControlInput(reference, self.last_feedback)
         self.last_command = self.controller.compute(self.last_control_input)
         self.status = self.last_plan.status if target is None else self.last_command.status
-        self.previous_target = target.angle if self.status == 'OK' else None
+        self.previous_target = target.angle if self.status in ('OK', 'CONTROL_WARMUP') else None
         return self.last_command.steer, self.last_command.speed
 
 def main(args=None):
