@@ -91,8 +91,8 @@ def draw_laser(result, config, status, steer, speed, label):
                   f' support={target.valid_ratio:.0%}', 120, (255, 235, 0))
             _text(image, f'finite mean (capped)={target.mean_distance_m:.2f}m'
                   f' inferred={target.inferred_ratio:.0%} score={target.score:.3f}', 144)
-        elif status in ('WAITING', 'STALE_DATA'):
-            _text(image, 'Cached scan only; no active target, STOP output', 120, (70, 70, 240))
+        elif status != 'OK':
+            _text(image, 'No active target; STOP output (see status / terminal)', 120, (70, 70, 240))
 
     cv2.circle(image, pixel(0, 0), round(config.radius_m * scale), (90, 150, 90), 1)
     rectangle = np.array([

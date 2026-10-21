@@ -26,6 +26,8 @@
 | `process_node/` | 本次作业主要修改范围，Python ROS 2 包 |
 | `process_node/process_node/process_node.py` | 传感器订阅、`process_core`、控制发布、图像显示 |
 | `process_node/process_node/perception.py` | 无 ROS 依赖的测距处理、候选通道和直线车体扫掠检查 |
+| `process_node/process_node/motion.py` | 独立里程计位姿差分、滤波、局部运动状态和按激光时间关联 |
+| `process_node/process_node/control.py` | 统一参考/反馈/控制量接口，当前比例映射与固定动力基线适配器 |
 | `process_node/process_node/visualization.py` | RGB 指示盘和激光诊断图绘制 |
 | `process_node/process_node/window_monitor.py` | 窗口关闭识别，兼容 GTK3 不支持 OpenCV 可见性属性的情况 |
 | `process_node/config/baseline.yaml`、`process_node/README.md` | 感知基线参数、运行和图例说明 |
@@ -67,11 +69,11 @@
 - 雷达角度单位为弧度，距离为米：`theta_i = angle_min + i * angle_increment`。课程说明前方为 +x、左侧为 +y，扫描约 360°；仍应读取每帧元数据并核实安装方向。前方扇区可能跨越扫描数组首尾。
 - 原始模板的 `Angle_increment = 1`、`Middle_angle = 540` 是硬编码；现有基线已改为读取每帧真实角度、处理数组首尾和无效测距。`target` 日志为真实角度（度），不再把下标称为角度。
 - `Control.steer`、`Control.speed` 均为 `int16`。底层节点将二者打包后原样发送；`speed` 是动力控制量，不是 m/s，`steer` 也不是已知车轮转角。中位、正负、范围和响应需逐车标定。
-- 现有 `encoder_imu_node.py` 的 `odom.twist.twist.linear` 使用速度差填写，不应未经核验当作真实线速度。后续可在 `process_node` 中用独立里程计的位置和时间差估速；不要因此修改底层包。
+- 现有 `encoder_imu_node.py` 的 `odom.twist.twist.linear` 使用速度差填写，不应未经核验当作真实线速度。当前 `motion.py` 已用独立里程计位置/姿态与消息时间差估速和角速度；不要因此修改底层包。默认要求坐标系 `odom` → `base_link`、有效反馈接收未超时且与激光时间接近；具体参数见 `baseline.yaml`。
 
 ## 构建与加载环境
 
-使用课程提供的 ROS 2 Humble 容器，常用依赖有 `rclpy`、NumPy、OpenCV、`cv_bridge` 和 `robotsdk_msgs`。新增同步等依赖时，在 `process_node` 内同步更新声明。
+使用课程提供的 ROS 2 Humble 容器，常用依赖有 `rclpy`、`nav_msgs`、NumPy、OpenCV、`cv_bridge` 和 `robotsdk_msgs`。新增同步等依赖时，在 `process_node` 内同步更新声明。
 
 ```bash
 cd ~/ros2_ws
@@ -119,7 +121,7 @@ ros2 topic echo /process_node/control
 
 播放结束后订阅节点继续等待，独立单调时钟定时器处理输入超时和窗口事件，超时输出配置的停止值。按 q、Esc、点击任一窗口关闭按钮或 Ctrl+C 可退出；无图形桌面可关闭可视化。
 
-当前实现范围仅为感知基线：保守处理未知、短缺口补齐、前向通道和直线车体包络检查。方向仍是参数化比例映射，有候选时动力值固定；S 弯行为、终点判断、独立运动反馈和 PD/PI 尚待后续实现。默认几何参数和控制值只供离线调试，实车需标定。
+当前实现范围为感知、独立运动反馈和统一控制接口基线：保守处理未知、短缺口补齐、前向通道和直线车体包络检查，独立反馈包含有符号速度、航向、局部位置和行程。`ControlInput` 将目标及关联反馈交给基线控制器，方向仍是比例映射，检查通过时动力值固定，物理目标速度为 None。默认 `require_motion_feedback=true`，反馈缺失、失效、超时或不能对齐时停止；false 只供离线感知观察。90°转弯行为、S 弯行为、终点判断和 PD/PI 尚待后续实现。默认几何参数和控制值只供离线调试，实车需标定。
 
 ## 实车运行与录制
 

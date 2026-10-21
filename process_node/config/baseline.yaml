@@ -1,9 +1,22 @@
-# 离线感知基线参数。几何尺寸、控制符号和动力值尚未经过实车标定。
+# 感知与独立运动反馈基线。几何尺寸、控制符号和动力值尚未经过实车标定。
 /**:
   ros__parameters:
     sensorTopic: /sync_store_node/allsensor
-    group_label: midterm-baseline
+    group_label: midterm-feedback-v1
     show_visualization: true
+    # 默认要求独立反馈有效且与激光时间接近；false 仅用于离线查看感知。
+    require_motion_feedback: true
+    odom_topic: /encoder_imu_node/odom
+    odom_frame_id: odom
+    odom_child_frame_id: base_link
+    odom_min_dt_s: 0.01
+    odom_max_dt_s: 0.5
+    odom_filter_tau_s: 0.15
+    odom_max_speed_mps: 3.0
+    odom_max_yaw_rate_rps: 6.0
+    odom_timeout_s: 0.5
+    odom_scan_tolerance_s: 0.15
+    odom_history_s: 2.0
     sensor_yaw_offset_deg: 0.0
     vehicle_width_m: 0.35
     front_overhang_m: 0.30

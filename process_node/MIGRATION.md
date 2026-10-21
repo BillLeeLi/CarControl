@@ -61,6 +61,8 @@ tar -xzf /tmp/process_node_transfer.tar.gz
 └── process_node/
     ├── process_node.py
     ├── perception.py
+    ├── motion.py
+    ├── control.py
     ├── visualization.py
     └── window_monitor.py
 ```
@@ -94,14 +96,14 @@ source install/setup.bash
 
 如果消息包来自另一个课程工作区，应先加载那个工作区的 `install/setup.bash`。不要自行改写消息定义来绕过缺包问题。
 
-当前依赖已在 `package.xml` 中声明，包括 `rclpy`、`sensor_msgs`、`geometry_msgs`、`std_msgs`、`robotsdk_msgs`、`cv_bridge`、NumPy、OpenCV、`python3-gi` 及 launch 相关包。相同镜像通常已具备这些依赖；缺失时根据报错补齐。GTK3 窗口关闭识别使用系统包 `python3-gi`。
+当前依赖已在 `package.xml` 中声明，包括 `rclpy`、`sensor_msgs`、**`nav_msgs`（独立里程计）**、`geometry_msgs`、`std_msgs`、`robotsdk_msgs`、`cv_bridge`、NumPy、OpenCV、`python3-gi` 及 launch 相关包。相同镜像通常已具备这些依赖；缺失时根据报错补齐。GTK3 窗口关闭识别使用系统包 `python3-gi`。
 
 构建完成后，`ros2 pkg prefix process_node` 应指向当前目标工作区的安装目录。若指向其他工作区，在新终端中按“ROS Humble → 课程依赖工作区（如有）→ 当前工作区”的顺序重新加载环境。
 
 ## 4. 不启动控制节点，先验证导入
 
 ```bash
-python3 -c "import rclpy, numpy, cv2, cv_bridge; from robotsdk_msgs.msg import AllSensor, Control; from process_node.process_node import LaserWindowAnalyzer; print('导入成功')"
+python3 -c "import rclpy, numpy, cv2, cv_bridge; from nav_msgs.msg import Odometry; from robotsdk_msgs.msg import AllSensor, Control; from process_node.process_node import LaserWindowAnalyzer; print('导入成功')"
 ```
 
 该命令不会创建控制节点或发布控制消息，可发现主要 Python 模块、消息包或环境加载问题。它不验证设备连接和车辆运动。
@@ -110,6 +112,7 @@ python3 -c "import rclpy, numpy, cv2, cv_bridge; from robotsdk_msgs.msg import A
 
 ```bash
 python3 -m pytest src/process_node/test/test_perception.py \
+  src/process_node/test/test_motion.py src/process_node/test/test_control.py \
   src/process_node/test/test_node_baseline.py \
   src/process_node/test/test_window_monitor.py -q
 ```
@@ -153,18 +156,24 @@ launch 默认加载随包安装的 `config/baseline.yaml`，并将控制话题�
 
 ```bash
 ros2 topic info /sync_store_node/allsensor --verbose
+ros2 topic info /encoder_imu_node/odom --verbose
 ros2 topic info /process_node/control --verbose
 ```
 
 确认输入话题有传感器发布端和本节点订阅端；控制话题只有预期的控制发布端，并有底层驱动订阅。话题存在不代表数据持续到达，还应结合本节点日志确认接收与分析正常。实际传感器话题不同，可通过配置中的 `sensorTopic` 适配。
 
+**当前默认要求独立里程计反馈有效**：话题通过 `odom_topic` 配置，坐标系默认 `odom` → `base_link`（对应 `odom_frame_id`、`odom_child_frame_id`，本节点不做 TF 变换）。节点用位置/姿态和消息时间估计速度与航向，不使用底层有问题的 `twist.linear`。需至少两个有效位姿，默认差分间隔 0.01–0.5 秒、有效反馈接收超时 0.5 秒、与激光关联时间差不超过 0.15 秒。缺失、异常、超时或不能对齐的反馈均会输出停止值；从日志 `odom`、`v/raw_v`、`dt`、`skew` 检查具体原因。
+
+时间阈值、滤波和跳变检查参数见 `config/baseline.yaml` 及 README。`require_motion_feedback=false` 仅供离线查看感知，不用于实车绕过反馈检查；完整 bag 回放需保留独立里程计话题。当前标签为 `midterm-feedback-v1`。
+
 现场按实际车辆核对以下配置：
 
 - 雷达安装偏角、车宽、雷达到车体前后端的距离及安全裕量。
+- 里程计坐标系和消息时间；低速前进的 `v` 应为正、倒退为负，静止应接近零，航向及位置尺度需核验。
 - 转向中位、正负方向、幅度、增益，以及动力值和停止值；`steer` 和 `speed` 均是底层控制量，不直接等于转角和 m/s。
 - 控制话题与底层驱动一致；切换自动前由助教确认车辆状态，临近碰撞立即切回手动。
 
-当前实现仅为激光感知基线：转向使用比例映射，有候选方向时动力值固定；尚未实现 S 弯行为、终点判断、独立运动反馈及 PD/PI。默认参数供离线调试，不能因编译成功就视为已完成整车控制标定。
+当前实现为感知、独立运动反馈与统一控制接口基线：反馈有效性参与门控，转向使用比例映射，检查通过时动力值固定。物理目标速度尚未启用，反馈尚未用于 PI 调节；90°转弯行为、S 弯行为、终点判断及 PD/PI 尚未实现。默认参数供离线调试，不能因编译成功就视为已完成整车控制标定。
 
 ## 7. 常见问题
 
@@ -175,7 +184,10 @@ ros2 topic info /process_node/control --verbose
 | 同名包冲突 | 把旧包备份移出工作区 `src/`，检查是否多套源码重复放置 |
 | 运行的似乎仍是旧版本 | 检查 `ros2 pkg prefix process_node`、环境加载顺序，并退出旧进程后重新启动 |
 | 一直 `WAITING` 或频繁 `STALE_DATA` | 检查整车驱动、输入话题、数据是否到达及跨容器通信环境 |
+| `WAITING_ODOM`/`INITIALIZING_ODOM` | 检查独立里程计话题和足够间隔的有效位姿；AllSensor 内的里程计不能替代它 |
+| `STALE_ODOM`/`UNALIGNED_ODOM` | 检查反馈接收、消息时间源及与激光的时间差；实车使用 `use_sim_time=false` |
+| `INVALID_ODOM`/`ODOM_POSE_JUMP` | 查看日志原因，核对坐标系、姿态、位置尺度和运动上限参数 |
 | 有输出但底层收不到 | 检查是否发布到了 `/control`；优先使用本文 launch，核对 `/process_node/control` 的端点 |
 | 无桌面或窗口无法打开 | 使用 `show_visualization:=false`；有桌面时检查显示环境和 GUI 依赖 |
 
-本文步骤依据当前仓库配置整理，尚未在助教设备上验证。首次迁移后应记录实际工作区、依赖差异及可用的整车启动方式，并据此更新本文。
+本文步骤依据当前仓库配置整理。当前版本已在本机课程容器中构建成功、通过 77 项感知/反馈/控制接口与集成测试，并验证真实 ROS 发布/订阅及反馈超时停车；尚未在助教设备上验证。首次迁移后应记录实际工作区、依赖差异及可用的整车启动方式，并据此更新本文。

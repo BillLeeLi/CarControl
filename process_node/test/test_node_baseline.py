@@ -2,6 +2,7 @@
 
 import math
 import time
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -12,6 +13,7 @@ from robotsdk_msgs.msg import AllSensor
 
 from process_node.process_node import LaserWindowAnalyzer
 from process_node.window_monitor import WindowMonitor
+from test_motion import odom
 
 
 @pytest.fixture
@@ -20,7 +22,8 @@ def node():
     rclpy.init(context=context)
     node = LaserWindowAnalyzer(
         context=context, namespace='/baseline_test',
-        parameter_overrides=[Parameter('show_visualization', value=False)])
+        parameter_overrides=[Parameter('show_visualization', value=False),
+                             Parameter('require_motion_feedback', value=False)])
     yield node
     node.destroy_node()
     context.shutdown()
@@ -68,7 +71,8 @@ def test_timestamp_rewind_discards_old_target(node, monkeypatch):
 
 def test_steering_limit_applies_to_offset_from_calibrated_center(node):
     node.steer_center = 20
-    node.steer_gain = -100000.0
+    node.controller.config = replace(node.controller.config, steer_center=20,
+                                     steer_gain_per_rad=-100000.0)
     msg = message()
     # 固定一个左侧可见开口，验证转向符号及中位附近限幅。
     angles = (np.arange(720) * msg.urg.angle_increment + math.pi) % (2 * math.pi) - math.pi
@@ -77,6 +81,74 @@ def test_steering_limit_applies_to_offset_from_calibrated_center(node):
     steer, _ = node.process_core(msg.urg)
     assert node.last_plan.target is not None
     assert steer == node.steer_center - node.steer_limit
+
+
+def require_feedback(node):
+    node.require_motion_feedback = True
+    node.controller.config = replace(node.controller.config, require_motion_feedback=True)
+
+
+def test_independent_feedback_is_required_and_attached_to_control_input(node):
+    require_feedback(node)
+    msg = message()
+    assert node.process_core(msg.urg)[1] == node.stop_speed
+    assert node.status == 'WAITING_ODOM'
+    node.odometry_callback(odom(99.9))
+    assert node.process_core(msg.urg)[1] == node.stop_speed
+    node.odometry_callback(odom(100.0, x=0.01))
+    assert node.process_core(msg.urg)[1] == node.cruise_speed
+    inputs = node.last_control_input
+    assert inputs.feedback.valid
+    assert inputs.feedback.state.speed_mps == pytest.approx(0.1)
+    assert inputs.reference.target_speed_mps is None
+    assert inputs.reference.stamp_ns == 100 * 10**9
+
+
+def test_feedback_watchdog_stops_while_laser_is_still_fresh(node, monkeypatch):
+    require_feedback(node)
+    node.odometry_callback(odom(99.9))
+    node.odometry_callback(odom(100.0, x=0.01))
+    node.laser_scan_callback(message())
+    assert node.speed_value == node.cruise_speed
+    node.motion.last_received = time.monotonic() - node.motion.config.timeout_s - 1
+    node.last_received = time.monotonic()
+    sent = []
+    monkeypatch.setattr(node, '_publish', lambda steer, speed: sent.append((steer, speed)))
+    node._tick()
+    assert node.status == 'STALE_ODOM'
+    assert sent[-1] == (node.steer_center, node.stop_speed)
+
+
+def test_fresh_but_unaligned_feedback_does_not_drive(node):
+    require_feedback(node)
+    node.odometry_callback(odom(98.9))
+    node.odometry_callback(odom(99.0))
+    assert node.process_core(message().urg)[1] == node.stop_speed
+    assert node.status == 'UNALIGNED_ODOM'
+
+
+def test_invalid_odometry_interrupts_motion_without_waiting_for_another_scan(node):
+    require_feedback(node)
+    node.odometry_callback(odom(99.9))
+    node.odometry_callback(odom(100.0))
+    node.laser_scan_callback(message())
+    assert node.speed_value == node.cruise_speed
+    node.odometry_callback(odom(100.1, frame='unexpected_frame'))
+    assert node.speed_value == node.stop_speed
+    assert node.status == 'INVALID_ODOM'
+
+
+def test_scan_rewind_clears_future_epoch_but_keeps_already_rewound_odometry(node):
+    require_feedback(node)
+    node.odometry_callback(odom(199.9))
+    node.odometry_callback(odom(200.0))
+    node.last_stamp_ns = 200 * 10**9
+    assert node.process_core(message().urg)[1] == node.stop_speed
+    assert node.motion.state is None
+    node.odometry_callback(odom(99.9))
+    node.odometry_callback(odom(100.0))
+    node.last_stamp_ns = 200 * 10**9
+    assert node.process_core(message().urg)[1] == node.cruise_speed
 
 
 @pytest.mark.parametrize('backend_error', [False, True])
