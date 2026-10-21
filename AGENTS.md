@@ -29,6 +29,7 @@
 | `process_node/process_node/visualization.py` | RGB 指示盘和激光诊断图绘制 |
 | `process_node/process_node/window_monitor.py` | 窗口关闭识别，兼容 GTK3 不支持 OpenCV 可见性属性的情况 |
 | `process_node/config/baseline.yaml`、`process_node/README.md` | 感知基线参数、运行和图例说明 |
+| `process_node/MIGRATION.md` | 迁移到助教设备、依赖与构建、实车启动及故障排查 |
 | `process_node/process_node/process_node_bk.py` | 镜像附带的另一版本，含额外依赖，不作为默认入口 |
 | `process_node/launch/process_node.launch.py` | 启动控制节点，并设置 `/process_node` 命名空间 |
 | `process_node/setup.py`、`setup.cfg` | 注册可执行入口和安装路径 |
@@ -143,6 +144,7 @@ ros2 bag record -o trial_01 /encoder_imu_node/cartoimu /encoder_imu_node/odom /s
 
 ## 后续开发与验证
 
+- 后续修改代码、配置或包结构后，必须同步核对并更新 `process_node/MIGRATION.md`，使迁移步骤与当前实现一致。涉及新增包、依赖、安装规则、构建/启动命令、参数、话题或实车标定要求时，必须同步修改对应说明；实现范围发生变化时也应更新文档中的当前能力和限制。现场迁移发现的环境差异及验证结果应回填该文档。
 - 先按 `IMPLEMENTATION_PLAN.md` 实施感知、行为、控制和离线分析；在用户要求仅分析或规划的轮次，只更新文档。
 - 保留 `process_core` 接收激光数据、返回 `(steer, speed)` 的集成入口，可将实现拆成 `process_node` 内部模块。将增益、阈值、车体尺寸、标定值等做成参数，并显示小组/版本标记。
 - 对 `NaN`、`inf`、无有效测距、数据超时、时间回跳和控制饱和作明确处理。控制器的时间差使用消息/ROS 时间，不能固定假定帧率。
