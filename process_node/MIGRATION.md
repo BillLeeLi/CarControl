@@ -170,22 +170,26 @@ ros2 topic info /process_node/control --verbose
 
 时间阈值、滤波和跳变检查参数见 `config/baseline.yaml` 及 README；完整 bag 回放需保留独立里程计话题。
 
-当前版本标签为 `midterm-inf-v2`，默认 `control_mode=closed_loop`，执行方向 PD 与速度 PI，物理请求速度 `target_speed_mps=0.2`。首个有效控制输入保持停止并建立时间基准，下一帧开始计算。停止、传感器/反馈失效或时间异常会清空控制器历史。闭环模式强制要求有效反馈；仅离线观察激光时需同时设置 `control_mode=baseline`、`require_motion_feedback=false`，仍不能连接实车驱动使用。
+当前版本标签为 `midterm-corridor-v3.1`，默认 `control_mode=closed_loop`、`reference_mode=corridor`，由走廊走向和横向偏移生成目标，再执行方向 PD 与速度 PI。正常物理请求速度 `target_speed_mps=0.2`，单墙、历史保持或较大偏差时默认减半。先连续 3 帧确认双墙，再由控制器预热一帧。停止、传感器/反馈失效或时间异常会清空相应控制历史，超时/异常也会清除走廊参考。corridor 仅支持 closed_loop 和有效独立反馈；仅离线观察激光时需同时设置 `reference_mode=perception`、`control_mode=baseline`、`require_motion_feedback=false`，仍不能连接实车驱动使用。
 
-首次直路测试可在专用配置中设置 `reference_mode=straight` 和较低的 `target_speed_mps`。straight 只接受合格的 0°候选，用于中位/速度 PI 测试，不锁定全局航向；perception 模式才跟踪感知目标方向。可用 `ros2 run` 的 ROS 参数覆盖，具体命令见 README。launch 的启动参数仍是 config、use_sim_time、show_visualization，其他参数通过 YAML 配置。
+首次中位/速度 PI 测试可用 `reference_mode=straight` 和较低的 `target_speed_mps`。straight 只接受合格的 0°候选，不锁定全局航向。完成基础标定后，以 `reference_mode=corridor` 在直走廊低速检查回正与回中；`reference_mode=perception` 保留上一版局部评分供离线对照。可用 `ros2 run` 的 ROS 参数覆盖，具体命令见 README。launch 的启动参数仍是 config、use_sim_time、show_visualization，其他参数通过 YAML 配置。
 
 现场按实际车辆核对以下配置：
 
 - 雷达安装偏角、车宽、雷达到车体前后端的距离及安全裕量。
-- 当前感知标记为 `midterm-inf-v2`：`+inf` 按受限无回波参与规划，`no_return_distance_m` 默认 5 m，实际受 `LaserScan.range_max` 限制；设 0 可禁用。先核对目标雷达驱动的 `+inf` 语义及有效探测范围，不把蓝色规划标记当成真实回波。`min_scan_finite_ratio` 默认 0.05，全无有限回波仍停止。迁移时应连同新的 `baseline.yaml` 一起复制，`min_bin_valid_ratio`/`min_window_valid_ratio` 现指有限回波与受限无回波的合计可用比例。
+- `+inf` 继续按受限无回波参与规划，`no_return_distance_m` 默认 5 m，实际受 `LaserScan.range_max` 限制；设 0 可禁用。先核对目标雷达驱动的 `+inf` 语义及有效探测范围，不把蓝色规划标记当成真实回波。`min_scan_finite_ratio` 默认 0.05，全无有限回波仍停止。`min_bin_valid_ratio`/`min_window_valid_ratio` 指有限回波与受限无回波的合计可用比例。
+- 新增 `corridor.py` 及整套 `corridor_*` 参数，必须连同新 YAML 迁移。`corridor_sensor_x_m/y_m` 是雷达相对 odom 子坐标系原点的安装平移，默认 0；雷达偏航仍由原 `sensor_yaw_offset_deg` 设置。核验走廊方向 `axis`、中线在左为正的 `center_left`、观测宽度 `width`，确保安装偏移不会被误当成车辆偏离中线。
+- 墙线拟合范围、网格、支持点数/跨度/误差、平行与宽度约束、历史跳变门槛及失效期限，见 README 的走廊参数表。墙线只使用真实回波；离群点只在拟合中排除，仍参与碰撞检查。单墙依赖近期双墙宽度，最多 0.6 s；双墙均缺失时默认最多保持 0.3 s，过期后重新确认。
 - 里程计坐标系和消息时间；低速前进的 `v` 应为正、倒退为负，静止应接近零，航向及位置尺度需核验。
 - 转向中位、正负方向、幅度、增益，以及动力值和停止值；`steer` 和 `speed` 均是底层控制量，不直接等于转角和 m/s。
 - `steer_sign`、`speed_sign`、前进动力死区和前馈系数/偏置，随后标定 PD/PI 增益；`speed_effort_limit`、变化率限制和物理目标速度上限需适配具体车辆。默认增益没有实车验证。
 - 控制话题与底层驱动一致；切换自动前由助教确认车辆状态，临近碰撞立即切回手动。
 
-当前已实现激光目标方向 PD、前进速度 PI、目标速度斜坡、限幅、变化率限制及条件积分抗饱和；零速和保护停止直接覆盖普通输出。动力仅支持前进幅度，不自动倒车制动。90°转弯行为、S 弯行为、终点判断、走廊中线跟踪和实际弯曲轨迹检查尚未实现。默认参数供离线调试，不能因编译成功就视为已完成整车控制标定。
+当前已实现走廊墙线/中线参考、里程计平移/转动补偿、限时单墙/历史保持和降速，以及方向 PD、前进速度 PI、目标速度斜坡、限幅、变化率限制及条件积分抗饱和。零速和保护停止直接覆盖普通输出。动力仅支持前进幅度，不自动倒车制动。90°转弯行为、S 弯行为、终点判断和实际弯曲轨迹检查尚未实现；到路口失去直走廊参考可能停车，本轮没有自动转弯接管。默认参数供离线调试，直走廊稳定回中与增益均需实车验证。
 
-无回波版本直接采样前向候选并包含 0°，不再要求候选先通过连续远距离回波开口筛选。绿色开口仅供诊断，可能出现 `gaps=0` 但有合格目标；蓝点是无回波规划上限，红点才是其他无效/未知。日志区分 `support`、`finite`、`no_return` 和 `planning_mean`。净空满足前瞻后不再额外加分；历史目标仍未按里程计补偿，走廊方向/中线纠偏待下一阶段实现。
+候选继续覆盖前向和 0°，corridor 还加入精确巡航参考角，并仅在其附近默认 ±5°选取合格方向；没有就 `CRUISE_BLOCKED` 停止。绿色开口仅供诊断，可能出现 `gaps=0` 但有合格目标；蓝点是无回波上限，红点是其他无效/未知。棕色墙线和紫色中线/参考是模型，青色才是获准执行的目标；参考出现不表示控制已获准。日志增加 corridor 状态、confidence、axis、center_left、width、观测/双墙年龄和降速比例。模型保存到 odom 坐标系，先补偿车体平移与转动再融合。
+
+输入调度修复新增 `input_buffer.py`，迁移时必须随包复制。ROS 独立线程只接收消息；主线程先批量更新里程计，再处理最新扫描、控制和 GTK 窗口。默认 `input_odom_queue_size=200`、`visualization_period_s=0.1`，GUI 最多 10 Hz 且不重复传输同一画面；启动日志应显示“输入独立接收”。接收时间不因处理延迟刷新，发布前再次检查新鲜度，缓存溢出重建反馈；`odom_scan_tolerance_s` 保持 0.15 s。没有新增第三方依赖，构建和启动命令不变。
 
 ## 7. 常见问题
 
@@ -197,11 +201,16 @@ ros2 topic info /process_node/control --verbose
 | 运行的似乎仍是旧版本 | 检查 `ros2 pkg prefix process_node`、环境加载顺序，并退出旧进程后重新启动 |
 | 一直 `WAITING` 或频繁 `STALE_DATA` | 检查整车驱动、输入话题、数据是否到达及跨容器通信环境 |
 | `WAITING_ODOM`/`INITIALIZING_ODOM` | 检查独立里程计话题和足够间隔的有效位姿；AllSensor 内的里程计不能替代它 |
-| `STALE_ODOM`/`UNALIGNED_ODOM` | 检查反馈接收、消息时间源及与激光的时间差；实车使用 `use_sim_time=false` |
+| `STALE_ODOM`/`UNALIGNED_ODOM` | 检查反馈接收、消息时间源和与激光的时间差，实车 use_sim_time=false；GUI 开启后才频繁出现时确认已迁移 input_buffer.py 与新版 main，观察 input_skipped_scans，不先放宽时间容差 |
+| `ODOM_QUEUE_OVERFLOW` | 接收缓存溢出，节点会停止并重建反馈；检查主线程长阻塞或系统负载，勿无限增大缓存 |
 | `INVALID_ODOM`/`ODOM_POSE_JUMP` | 查看日志原因，核对坐标系、姿态、位置尺度和运动上限参数 |
 | `CONTROL_WARMUP` | 等待下一次有效控制消息；若一直出现，检查是否反复触发保护或时间异常 |
 | `CONTROL_TIME_INVALID`/`CONTROL_TIME_GAP` | 检查激光时间戳是否重复、回跳或间隔过长；控制器已停止并清空历史 |
 | `NO_STRAIGHT_PATH` | straight 测试没有合格的 0°候选；不应通过强制前进绕过感知检查 |
+| `CORRIDOR_ACQUIRING`/`CORRIDOR_LOST` | 检查真实墙线是否有足够跨度、双墙是否平行及宽度是否合理；初始化需连续确认，不能仅增大保持时间让车盲走 |
+| `CORRIDOR_SINGLE_WALL`/`CORRIDOR_HOLD` | 参考正在限时降速；观察缺失侧、观测年龄、双墙年龄，过期后停止是预期行为 |
+| `CRUISE_BLOCKED` | 有其他候选但参考附近不可通行；本轮没有自动绕障接管，不应改成直接追逐侧向开口 |
+| `CORRIDOR_OUT_OF_RANGE`/`CORRIDOR_TIME_INVALID` | 巡航纠偏角超出范围，或激光时间不连续；核对安装、位姿与扫描时间，不直接取消限幅 |
 | `INSUFFICIENT_FINITE_SUPPORT`/`NO_VALID_RANGES` | 检查真实有限回波是否过少；即使前方允许无回波，整帧异常仍停止 |
 | `NO_CLEAR_PATH` | 检查真实近点、车体包络、前瞻与无回波上限；不直接删除近点或盲目缩小车体参数 |
 | PI 输出较小、车辆不启动 | 核对控制符号、前馈和起动死区；增益、积分上限和斜坡见 README，不盲目加大积分 |
@@ -209,3 +218,7 @@ ros2 topic info /process_node/control --verbose
 | 有输出但窗口都不出现 | 检查 show_visualization 与 DISPLAY；VS Code 更新/重连后可重新连接或重启容器恢复转发，勿写死显示地址 |
 
 本文步骤依据当前仓库配置整理。此前 PD/PI 版本通过 115 项测试，并用约 1 秒真实雷达/里程计数据验证 ROS 链路、控制计算及超时恢复。2026-10-22 的无回波版本已构建成功并通过 **135 项测试**；对 bag 开头 30 秒逐条运行实际节点回调：359 帧中 328 帧正常控制、3 帧预热、28 帧因真实近点进入包络而停止，331 帧包含 0°候选；不是实车通过率。尚未在助教设备或实车验证。本阶段没有新增第三方运行依赖，打包和启动命令不变；新增小型测距测试样本随整个包迁移。首次迁移后应记录实际工作区、依赖差异及可用的整车启动方式，并据此更新本文。
+
+走廊参考版本已构建并通过 **174 项测试**，同一 30 秒得到 356 帧双墙参考、1 帧单墙、2 帧初始确认；最终 326 帧正常控制、3 帧控制预热、2 帧走廊确认、28 帧原近点包络停止。10–30 秒均正常计算，并产生有符号的回中修正。已在隔离 ROS 域用安装后的 launch/YAML 与真实 bag play 检查运行、反馈未对齐时停止并重新确认、播放停止后的超时停车和正常退出。新增 `corridor.py` 随包自动安装，RANSAC/最小二乘只用已有 NumPy，无新增第三方运行依赖；现场仍需标定安装偏移、目标点距离、横向增益、降速门槛和 PD/PI。
+
+v3.1 调度修复通过 **181 项测试**。在用户相同的 VS Code/X11 图形环境中开启真实窗口回放约 30 s，316 帧反馈全部有效、无未对齐，关联差约 ±13 ms；10–30 秒处理的 211 帧均正常控制。主动替换 35 个中间扫描以处理最新观测，播放停止后超时停车并正常退出。此前只关闭 GUI 做实时验证未覆盖图形转发负载，本次补充了该条件；以上仍非实车结果。

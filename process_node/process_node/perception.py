@@ -234,7 +234,7 @@ def _planning_clearance(angle, points, data, config, raw_window):
     return clearance
 
 
-def analyze_scan(scan, config, previous_target=None):
+def analyze_scan(scan, config, previous_target=None, extra_headings=()):
     """返回感知和选方向结果；不发布指令，便于用合成数据和 bag 单独验证。"""
     try:
         data = prepare_scan(scan, config)
@@ -243,6 +243,11 @@ def analyze_scan(scan, config, previous_target=None):
         data = ScanData(empty, empty, empty.astype(bool), empty.astype(bool), empty.astype(bool),
                         empty, empty, empty.astype(bool), 0.0, empty.astype(bool), 0.0)
         return PlanResult(data, 'INVALID_METADATA', str(error))
+    return analyze_prepared_scan(data, config, previous_target, extra_headings)
+
+
+def analyze_prepared_scan(data, config, previous_target=None, extra_headings=()):
+    """复用已整理的扫描，允许把连续的巡航参考角加入同一套车体/覆盖检查。"""
     if data.too_close.any():
         return PlanResult(data, 'TOO_CLOSE', '传感器报告近于最小量程，停止并检查近障碍')
     if not data.valid.any():
@@ -284,6 +289,9 @@ def analyze_scan(scan, config, previous_target=None):
     headings = data.bin_angles[heading_mask]
     if half_window <= search_half_angle:
         headings = np.sort(np.r_[headings, 0.0])
+    extra = [float(angle) for angle in extra_headings
+             if math.isfinite(angle) and abs(angle) + half_window <= search_half_angle]
+    headings = np.unique(np.r_[headings, extra])
     has_coverage = False
     for angle in headings:
         raw_window = np.abs(wrap_angle(data.angles - angle)) <= half_window

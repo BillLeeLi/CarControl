@@ -22,7 +22,8 @@ def node():
     rclpy.init(context=context)
     node = LaserWindowAnalyzer(
         context=context, namespace='/closed_loop_test',
-        parameter_overrides=[Parameter('show_visualization', value=False)],
+        parameter_overrides=[Parameter('show_visualization', value=False),
+                             Parameter('reference_mode', value='perception')],
     )
     yield node
     node.destroy_node()
@@ -47,7 +48,7 @@ def start(node):
     assert node.status == 'OK'
 
 
-def test_default_mode_runs_pi_with_physical_target_and_publishes_limited_output(node):
+def test_perception_mode_runs_pi_with_physical_target_and_publishes_limited_output(node):
     assert isinstance(node.controller, PIDController)
     start(node)
     assert node.last_control_input.reference.target_speed_mps == 0.2

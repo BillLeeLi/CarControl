@@ -2,10 +2,12 @@
 /**:
   ros__parameters:
     sensorTopic: /sync_store_node/allsensor
-    group_label: midterm-inf-v2
+    group_label: midterm-corridor-v3.1
     show_visualization: true
+    input_odom_queue_size: 200  # 独立接收线程的有界缓存；主线程先批量更新里程计
+    visualization_period_s: 0.1  # 最多 10 Hz 刷新图像，窗口/按键事件仍持续处理
     control_mode: closed_loop  # closed_loop: PD/PI；baseline: 旧比例转向和固定动力
-    reference_mode: perception  # perception: 跟踪感知方向；straight: 仅接受合格的 0° 候选
+    reference_mode: corridor  # corridor: 走廊回正/回中；perception: 旧评分；straight: 中位/PI 测试
     target_speed_mps: 0.2  # 物理目标速度，0 直接停车；不是底层 speed 控制量
     # 默认要求独立反馈有效且与激光时间接近；false 仅用于离线查看感知。
     require_motion_feedback: true
@@ -40,6 +42,43 @@
     max_inferred_ratio: 0.2
     forward_weight: 0.25
     continuity_weight: 0.10
+    # 墙面拟合只使用真实有限点；这些安装平移相对 odom_child_frame_id 原点。
+    corridor_sensor_x_m: 0.0
+    corridor_sensor_y_m: 0.0
+    corridor_fit_range_m: 4.5
+    corridor_fit_front_m: 4.0
+    corridor_fit_rear_m: 0.3
+    corridor_voxel_m: 0.05
+    corridor_ransac_trials: 80
+    corridor_max_lines: 6
+    corridor_line_tolerance_m: 0.06
+    corridor_min_inliers: 12
+    corridor_min_span_m: 1.2
+    corridor_max_rmse_m: 0.04
+    corridor_min_wall_distance_m: 0.25
+    corridor_max_heading_deg: 45.0
+    corridor_parallel_tolerance_deg: 8.0
+    corridor_min_width_m: 0.9
+    corridor_max_width_m: 3.5
+    # 相邻墙面观测先补偿车体运动，再检查跳变和做低通。
+    corridor_max_heading_change_deg: 12.0
+    corridor_max_center_change_m: 0.20
+    corridor_max_width_change_m: 0.25
+    corridor_confirm_frames: 3
+    corridor_filter_tau_s: 0.25
+    corridor_max_update_gap_s: 0.5
+    corridor_single_wall_timeout_s: 0.6
+    corridor_hold_timeout_s: 0.3
+    corridor_max_unobserved_travel_m: 0.2
+    # 局部中线目标；偏差较大、单墙或历史保持时，请求速度乘 slow_speed_scale。
+    corridor_goal_distance_m: 1.5
+    corridor_lateral_gain: 1.0
+    corridor_max_lateral_correction_deg: 20.0
+    corridor_max_target_deg: 45.0
+    corridor_candidate_tolerance_deg: 5.0
+    corridor_recovery_heading_deg: 15.0
+    corridor_recovery_offset_m: 0.25
+    corridor_slow_speed_scale: 0.5
     steer_center: 0
     steer_limit: 600
     # 以下两项仅在 control_mode=baseline 时使用。

@@ -26,11 +26,11 @@ def draw_steering(image, steer, center, limit, label, status, target_angle):
     _text(image, f'target={target}  {status}', 205)
 
 
-def draw_laser(result, config, status, steer, speed, label, command=None):
+def draw_laser(result, config, status, steer, speed, label, command=None, corridor=None):
     """鸟瞰图：车头向上、车体左方在屏幕左方，与翻转后的 RGB 独立。"""
-    image = np.full((800, 800, 3), 23, dtype=np.uint8)
-    origin = np.array([400.0, 435.0])
-    scale = 270.0 / config.max_distance_m
+    image = np.full((900, 800, 3), 23, dtype=np.uint8)
+    origin = np.array([400.0, 500.0])
+    scale = 240.0 / config.max_distance_m
 
     def pixel(x, y):
         return tuple(np.rint(origin + [-y * scale, -x * scale]).astype(int))
@@ -88,7 +88,6 @@ def draw_laser(result, config, status, steer, speed, label, command=None):
                 b = a + config.lookahead_m * forward
                 cv2.line(image, pixel(*a), pixel(*b), (0, 150, 0), 2)
             cv2.circle(image, end, round(config.radius_m * scale), (0, 150, 0), 2)
-            cv2.arrowedLine(image, pixel(0, 0), end, (255, 235, 0), 3)
             _text(image, f'target={math.degrees(target.angle):+.1f}deg'
                   f' clearance={target.clearance_m:.2f}m'
                   f' support={target.support_ratio:.0%}', 120, (255, 235, 0))
@@ -105,6 +104,36 @@ def draw_laser(result, config, status, steer, speed, label, command=None):
         _text(image, f'speed P/I={diag.speed_p:+.1f}/{diag.speed_i:+.1f}'
               f' steer P/D={diag.steer_p:+.1f}/{diag.steer_d:+.1f}', 192)
 
+    if corridor is not None:
+        age = '--' if corridor.measurement_age_s is None else f'{corridor.measurement_age_s:.2f}s'
+        _text(image, f'{corridor.status} confidence={corridor.confidence:.2f} age={age}', 216)
+        if corridor.heading_rad is not None:
+            heading = corridor.heading_rad
+            normal = np.array([-math.sin(heading), math.cos(heading)])
+            tangent = np.array([math.cos(heading), math.sin(heading)])
+            # 模型在车体原点定义；画到以雷达原点为中心的图上时减去安装平移。
+            # 传入的估计记录安装偏移，避免把雷达和车体原点默认为同一点。
+            sensor_offset = np.array(corridor.sensor_offset_xy)
+            center = corridor.lateral_error_m
+            for offset, color in ((center + corridor.width_m / 2, (180, 110, 90)),
+                                  (center - corridor.width_m / 2, (180, 110, 90)),
+                                  (center, (210, 110, 230))):
+                a = -0.3 * tangent + offset * normal - sensor_offset
+                b = 4.0 * tangent + offset * normal - sensor_offset
+                cv2.line(image, pixel(*a), pixel(*b), color, 2)
+            if corridor.target_point_xy is not None:
+                goal = np.array(corridor.target_point_xy) - sensor_offset
+                cv2.arrowedLine(image, pixel(*(-sensor_offset)), pixel(*goal), (210, 110, 230), 2)
+            reference = '--' if corridor.target_angle_rad is None \
+                else f'{math.degrees(corridor.target_angle_rad):+.1f}'
+            _text(image, f'axis={math.degrees(heading):+.1f}deg center_left={center:+.2f}m'
+                  f' width={corridor.width_m:.2f}m ref={reference}deg', 240)
+
+    # 活动目标最后画，避免巡航参考与目标重合时紫色模型线盖住青色箭头。
+    if result is not None and result.target is not None and status == 'OK':
+        cv2.arrowedLine(image, pixel(0, 0), ray(result.target.angle, config.lookahead_m),
+                       (255, 235, 0), 3)
+
     cv2.circle(image, pixel(0, 0), round(config.radius_m * scale), (90, 150, 90), 1)
     rectangle = np.array([
         pixel(config.front_overhang_m, config.vehicle_width_m / 2),
@@ -113,7 +142,8 @@ def draw_laser(result, config, status, steer, speed, label, command=None):
         pixel(-config.rear_overhang_m, config.vehicle_width_m / 2),
     ], dtype=np.int32)
     cv2.polylines(image, [rectangle], True, (0, 220, 0), 2)
-    _text(image, 'white: measured | blue: bounded no-return | red: invalid / unknown', 746)
-    _text(image, 'orange: inferred short hole | green: gap / straight swept footprint', 768)
-    _text(image, 'cyan: selected target | q / Esc / close window: stop and exit', 790)
+    _text(image, 'white: measured | blue: bounded no-return | red: invalid / unknown', 816)
+    _text(image, 'orange: inferred hole | green: gap / straight swept footprint', 838)
+    _text(image, 'brown walls / purple center & reference: model, not measured obstacles', 860)
+    _text(image, 'cyan: active target | q / Esc / close window: stop and exit', 882)
     return image

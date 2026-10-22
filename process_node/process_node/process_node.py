@@ -4,6 +4,7 @@ from dataclasses import fields, replace
 import math
 import os
 import signal
+import threading
 import time
 
 import cv2
@@ -12,7 +13,7 @@ from nav_msgs.msg import Odometry
 import numpy as np
 import rclpy
 from rclpy.clock import Clock, ClockType
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from robotsdk_msgs.msg import AllSensor, Control
@@ -20,9 +21,11 @@ from robotsdk_msgs.msg import AllSensor, Control
 from process_node.control import (
     BaselineControlConfig, BaselineController, ControlInput, ControlReference,
 )
+from process_node.corridor import CorridorConfig, CorridorTracker, select_cruise_candidate
+from process_node.input_buffer import InputBuffer
 from process_node.motion import MotionConfig, MotionEstimator
 from process_node.pid_controller import PIDConfig, PIDController
-from process_node.perception import PlannerConfig, analyze_scan
+from process_node.perception import PlannerConfig, analyze_scan, analyze_prepared_scan, prepare_scan
 from process_node.visualization import draw_laser, draw_steering
 from process_node.window_monitor import create_window_monitor
 
@@ -45,10 +48,10 @@ class LaserWindowAnalyzer(Node):
             }
         )
         self.declare_parameter("sensorTopic", "/sync_store_node/allsensor")
-        self.declare_parameter("group_label", "midterm-inf-v2")
+        self.declare_parameter("group_label", "midterm-corridor-v3.1")
         self.declare_parameter("show_visualization", True)
         self.declare_parameter("control_mode", "closed_loop")
-        self.declare_parameter("reference_mode", "perception")
+        self.declare_parameter("reference_mode", "corridor")
         self.declare_parameter("target_speed_mps", 0.2)
         self.control_mode = self.get_parameter("control_mode").value
         self.reference_mode = self.get_parameter("reference_mode").value
@@ -68,8 +71,10 @@ class LaserWindowAnalyzer(Node):
         })
         if self.control_mode not in ('closed_loop', 'baseline'):
             raise ValueError('control_mode 必须为 closed_loop 或 baseline')
-        if self.reference_mode not in ('perception', 'straight'):
-            raise ValueError('reference_mode 必须为 perception 或 straight')
+        if self.reference_mode not in ('corridor', 'perception', 'straight'):
+            raise ValueError('reference_mode 必须为 corridor、perception 或 straight')
+        if self.reference_mode == 'corridor' and self.control_mode != 'closed_loop':
+            raise ValueError('corridor 需要 closed_loop；旧基线对照请选择 perception')
         if (not math.isfinite(self.target_speed_mps)
                 or not 0 <= self.target_speed_mps <= pid_config.max_target_speed_mps):
             raise ValueError('target_speed_mps 必须在 [0, max_target_speed_mps] 内')
@@ -85,6 +90,14 @@ class LaserWindowAnalyzer(Node):
             item.name: self.get_parameter("odom_" + item.name).value
             for item in fields(motion_defaults)
         }))
+        corridor_defaults = CorridorConfig()
+        for item in fields(corridor_defaults):
+            self.declare_parameter('corridor_' + item.name, getattr(corridor_defaults, item.name))
+        self.corridor = CorridorTracker(CorridorConfig(**{
+            item.name: self.get_parameter('corridor_' + item.name).value
+            for item in fields(corridor_defaults)
+        }))
+        self.last_corridor = None
         self.declare_parameter("sensor_timeout_s", 1.0)
         self.declare_parameter("log_period_s", 1.0)
         self.steer_center = self.get_parameter("steer_center").value
@@ -103,16 +116,25 @@ class LaserWindowAnalyzer(Node):
             raise ValueError("超时及日志周期必须为正有限值")
 
         self.label = self.get_parameter("group_label").value
+        self.declare_parameter('input_odom_queue_size', 200)
+        self.declare_parameter('visualization_period_s', 0.1)
+        self.inputs = InputBuffer(self.get_parameter('input_odom_queue_size').value)
+        self.visualization_period = self.get_parameter('visualization_period_s').value
+        if not math.isfinite(self.visualization_period) or self.visualization_period <= 0:
+            raise ValueError('visualization_period_s 必须是正有限数值')
+        self.last_gui_time = -math.inf
+        self.last_gui_signature = None
+        self.plan_revision = 0
         self.bridge = CvBridge()
         self.publisher_ = self.create_publisher(Control, "control", 10)
         self.subscription = self.create_subscription(
             AllSensor,
             self.get_parameter("sensorTopic").value,
-            self.laser_scan_callback,
-            10,
+            self.inputs.receive_sensor,
+            1,
         )
         self.odometry_subscription = self.create_subscription(
-            Odometry, self.get_parameter("odom_topic").value, self.odometry_callback, 50,
+            Odometry, self.get_parameter("odom_topic").value, self.inputs.receive_odometry, 200,
         )
         self.last_plan = None
         self.previous_target = None
@@ -143,14 +165,16 @@ class LaserWindowAnalyzer(Node):
             )
             self.gui = False
 
-        # 独立的单调时钟定时器：bag 播完或暂停后，仍处理窗口事件及输入超时。
+        # ROS 接收线程只唤醒主线程；GTK/OpenCV 的创建、显示和关闭始终留在主线程。
+        # 仍使用单调时钟，bag 暂停或播放结束也不会阻止超时和窗口事件处理。
         self.steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
-        self.ui_timer = self.create_timer(0.05, self._tick, clock=self.steady_clock)
+        self.ui_timer = self.create_timer(0.05, self.inputs.ready.set, clock=self.steady_clock)
         self.get_logger().info(
             f"[{self.label}] control_mode={self.control_mode}，reference_mode={self.reference_mode}；"
             f"control={self.publisher_.topic_name}，"
             f"odom={self.odometry_subscription.topic_name}，"
             f"require_motion_feedback={self.require_motion_feedback}。"
+            f"输入独立接收，GUI={self.gui}，刷新间隔={self.visualization_period:.2f}s。"
             "尺寸、控制符号、停止值、前馈和控制增益上车前需标定。"
         )
 
@@ -168,14 +192,35 @@ class LaserWindowAnalyzer(Node):
         self.last_command = self.controller.stop(self.status, "停止请求覆盖普通控制输出")
         self._publish(self.last_command.steer, self.last_command.speed)
 
-    def odometry_callback(self, msg):
+    def process_pending_inputs(self):
+        """主线程先消化已接收的里程计，再处理最新扫描，避免 GUI 拖慢反馈队列。"""
+        odometry, sensor, overflow = self.inputs.take()
+        if overflow:
+            self.motion.reset('ODOM_QUEUE_OVERFLOW', '里程计接收缓冲溢出，重新建立反馈')
+            self.previous_target = None
+            self.controller.reset()
+            self._reset_corridor()
+            self.status = 'ODOM_QUEUE_OVERFLOW'
+            self.publish_stop()
+            self.get_logger().warning('里程计接收缓冲溢出，已停止并重新建立差分历史')
+        for item in odometry:
+            self.odometry_callback(item.message, received_at=item.received_at)
+        if sensor is not None:
+            # 使用接收时间判断新鲜度；慢处理不能让一条旧消息重新“保鲜”。
+            if time.monotonic() - sensor.received_at > self.timeout:
+                self.last_received = sensor.received_at
+            else:
+                self.laser_scan_callback(sensor.message, received_at=sensor.received_at)
+
+    def odometry_callback(self, msg, received_at=None):
         """运动反馈独立更新，不使用 AllSensor 中的里程计或 IMU 字段。"""
         now = time.monotonic()
         generation = self.motion.generation
-        self.motion.update(msg, received_at=now)
+        self.motion.update(msg, received_at=now if received_at is None else received_at)
         if self.motion.generation != generation:
             self.previous_target = None
             self.controller.reset()
+            self._reset_corridor()
         sensor_fresh = self.last_received is not None and now - self.last_received <= self.timeout
         # 与激光回调/定时器使用同一种关联结果，避免日志在“最新里程计有效”
         # 和“关联到本帧激光的反馈无效”之间反复切换。
@@ -186,14 +231,28 @@ class LaserWindowAnalyzer(Node):
                 and sensor_fresh):
             self.status = self.last_feedback.status
             self.previous_target = None
+            self._reset_corridor()
             self.publish_stop()
             self.last_stop_time = now
             self.laser_image = None
         self._log_decision()
 
-    def laser_scan_callback(self, msg):
-        self.last_received = time.monotonic()
+    def laser_scan_callback(self, msg, received_at=None):
+        self.last_received = time.monotonic() if received_at is None else received_at
         steer, speed = self.process_core(msg.urg)
+        # 计算若耗时过长，发布前再次检查真实接收时间，不能把已过期的结果发给车辆。
+        now = time.monotonic()
+        expired = 'STALE_DATA' if now - self.last_received > self.timeout else None
+        feedback = self.motion.feedback(self.last_stamp_ns, now=now)
+        if expired is None and self.require_motion_feedback and not feedback.valid:
+            self.last_feedback = feedback
+            expired = feedback.status
+        if expired is not None:
+            self.status = expired
+            self.previous_target = None
+            self._reset_corridor()
+            self.last_command = self.controller.stop(expired, '发布前输入/反馈已过期')
+            steer, speed = self.last_command.steer, self.last_command.speed
         self._publish(steer, speed)
         self._log_decision()
         if self.gui:
@@ -215,6 +274,7 @@ class LaserWindowAnalyzer(Node):
                 self.speed_value,
                 self.label,
                 command=self.last_command,
+                corridor=self.last_corridor,
             )
 
     def _log_decision(self):
@@ -260,6 +320,17 @@ class LaserWindowAnalyzer(Node):
                 f" D_reset={diagnostics.derivative_reset}"
             )
         result = self.last_plan
+        if self.last_corridor is not None:
+            estimate = self.last_corridor
+            control_text += f' | corridor={estimate.status} confidence={estimate.confidence:.2f}'
+            if estimate.heading_rad is not None:
+                control_text += (
+                    f' axis={math.degrees(estimate.heading_rad):+.2f}deg'
+                    f' center_left={estimate.lateral_error_m:+.3f}m width={estimate.width_m:.3f}m'
+                    f' age={estimate.measurement_age_s:.3f}s pair_age={estimate.pair_age_s:.3f}s'
+                    f' speed_scale={estimate.speed_scale:.2f}'
+                )
+            control_text += f' ({estimate.reason})'
         if result is None or self.status == "STALE_DATA":
             self.get_logger().info(
                 f"[{self.label}] {self.status}：等待有效传感器输入，输出停止值 | {motion_text}"
@@ -289,6 +360,7 @@ class LaserWindowAnalyzer(Node):
             f" clearance={clearance} front={front}"
             f" gaps={len(result.gaps)} candidates={len(result.candidates)}"
             f" | steer={self.steer_value} speed={self.speed_value} | {motion_text}"
+            f" | input_skipped_scans={self.inputs.skipped_scans}"
             f" | perception={result.status}: {result.reason}"
             f" | {control_text}"
         )
@@ -298,6 +370,7 @@ class LaserWindowAnalyzer(Node):
         if self.last_received is None or now - self.last_received > self.timeout:
             self.status = "WAITING" if self.last_received is None else "STALE_DATA"
             self.previous_target = None
+            self._reset_corridor()
             if now - self.last_stop_time >= 0.2:
                 self.publish_stop()
                 self.last_stop_time = now
@@ -309,6 +382,7 @@ class LaserWindowAnalyzer(Node):
             if self.require_motion_feedback and not self.last_feedback.valid:
                 self.status = self.last_feedback.status
                 self.previous_target = None
+                self._reset_corridor()
                 if now - self.last_stop_time >= 0.2:
                     self.publish_stop()
                     self.last_stop_time = now
@@ -332,30 +406,27 @@ class LaserWindowAnalyzer(Node):
                 for name in (self.CAMERA_WINDOW, self.LASER_WINDOW):
                     cv2.namedWindow(name, cv2.WINDOW_NORMAL)
                 self.windows_created = True
-            image = self.camera_image.copy()
-            target = self.previous_target if self.status == "OK" else None
-            draw_steering(
-                image,
-                self.steer_value,
-                self.steer_center,
-                self.steer_limit,
-                self.label,
-                self.status,
-                target,
-            )
-            cv2.imshow(self.CAMERA_WINDOW, image)
-            laser = self.laser_image
-            if laser is None:
-                laser = draw_laser(
-                    self.last_plan,
-                    self.config,
-                    self.status,
-                    self.steer_value,
-                    self.speed_value,
-                    self.label,
-                    command=self.last_command,
-                )
-            cv2.imshow(self.LASER_WINDOW, laser)
+            signature = (self.plan_revision, self.status, self.steer_value, self.speed_value)
+            # X11/VS Code 转发大图像可能很慢。状态不变不重传整幅图，
+            # 新帧最多按配置频率刷新，但每次 tick 都继续处理按键和窗口关闭。
+            if (signature != self.last_gui_signature
+                    and (now - self.last_gui_time >= self.visualization_period
+                         or self.last_gui_signature is None
+                         or self.status != self.last_gui_signature[1])):
+                image = self.camera_image.copy()
+                target = self.previous_target if self.status == "OK" else None
+                draw_steering(image, self.steer_value, self.steer_center, self.steer_limit,
+                              self.label, self.status, target)
+                cv2.imshow(self.CAMERA_WINDOW, image)
+                laser = self.laser_image
+                if laser is None:
+                    laser = draw_laser(
+                        self.last_plan, self.config, self.status, self.steer_value,
+                        self.speed_value, self.label, command=self.last_command,
+                        corridor=self.last_corridor,
+                    )
+                cv2.imshow(self.LASER_WINDOW, laser)
+                self.last_gui_signature, self.last_gui_time = signature, now
             if cv2.waitKey(1) & 0xFF in (27, ord("q")):
                 self.publish_stop()
                 self.exit_requested = True
@@ -373,19 +444,56 @@ class LaserWindowAnalyzer(Node):
             except cv2.error:
                 pass
 
+    def _reset_corridor(self):
+        self.corridor.reset()
+        self.last_corridor = None
+
+    def _corridor_plan(self, urg, stamp_ns):
+        """先生成运动补偿后的巡航参考，再由原感知检查实际可执行候选。"""
+        try:
+            data = prepare_scan(urg, self.config)
+        except (ValueError, TypeError, OverflowError):
+            self._reset_corridor()
+            return analyze_scan(urg, self.config)
+        if (data.too_close.any() or not data.valid.any()
+                or data.valid_ratio < self.config.min_scan_finite_ratio):
+            self._reset_corridor()
+            return analyze_prepared_scan(data, self.config)
+        estimate = self.corridor.update(data, self.last_feedback, stamp_ns)
+        self.last_corridor = estimate
+        # 精确参考角也必须通过覆盖、无回波范围和完整车体扫掠，不能强行下发。
+        extra = (estimate.target_angle_rad,) if estimate.usable else ()
+        result = analyze_prepared_scan(data, self.config, extra_headings=extra)
+        if result.status != 'OK':
+            return result
+        if not estimate.usable:
+            status = estimate.status if self.last_feedback.valid else self.last_feedback.status
+            return replace(result, target=None, status=status, reason=estimate.reason)
+        target = select_cruise_candidate(result.candidates, estimate, self.corridor.config)
+        return replace(result, target=target, status='OK' if target is not None else 'CRUISE_BLOCKED',
+                       reason='巡航参考附近的候选通过覆盖和车体检查' if target is not None
+                       else '巡航参考附近没有合格候选，停止并等待后续行为')
+
     def process_core(self, urg):
         """输入 LaserScan，返回 (steer, speed)，保持课程模板接口。"""
+        self.plan_revision += 1
         stamp = urg.header.stamp
         stamp_ns = stamp.sec * 10**9 + stamp.nanosec
         if self.last_stamp_ns is not None and stamp_ns < self.last_stamp_ns:
             self.previous_target = None
             self.controller.reset()
+            self._reset_corridor()
             # 新一轮 odom 可能先于激光到达，只有仍留着旧时间段的反馈时才清空。
             if (self.motion.state is not None and self.motion.state.stamp_ns
                     > stamp_ns + round(self.motion.config.scan_tolerance_s * 1e9)):
                 self.motion.reset('ODOM_TIME_REWIND', '激光时间回跳，等待同一时间段的新反馈')
         self.last_stamp_ns = stamp_ns
-        self.last_plan = analyze_scan(urg, self.config, self.previous_target)
+        self.last_feedback = self.motion.feedback(stamp_ns)
+        if self.reference_mode == 'corridor':
+            self.last_plan = self._corridor_plan(urg, stamp_ns)
+        else:
+            self.last_corridor = None
+            self.last_plan = analyze_scan(urg, self.config, self.previous_target)
         if self.reference_mode == 'straight' and self.last_plan.target is not None:
             # 直路测试只接受通过了原有观测及车体检查的 0° 候选，不强行向前。
             straight = next((item for item in self.last_plan.candidates
@@ -397,11 +505,13 @@ class LaserWindowAnalyzer(Node):
                 else '直路测试：正前方没有合格候选，停止而不选择侧向通道',
             )
         target = self.last_plan.target
-        self.last_feedback = self.motion.feedback(stamp_ns)
+        speed_scale = self.last_corridor.speed_scale \
+            if self.reference_mode == 'corridor' and self.last_corridor is not None else 1.0
         reference = ControlReference(
             stamp_ns=stamp_ns,
             heading_error_rad=None if target is None else target.angle,
-            target_speed_mps=self.target_speed_mps if self.control_mode == 'closed_loop' else None,
+            target_speed_mps=self.target_speed_mps * speed_scale
+            if self.control_mode == 'closed_loop' else None,
             stop_requested=target is None,
             reason=self.last_plan.reason,
             reference_id=self.reference_mode,
@@ -426,16 +536,45 @@ def main(args=None):
         sig: signal.signal(sig, request_stop) for sig in (signal.SIGINT, signal.SIGTERM)
     }
     node = None
+    executor = None
+    receiver = None
+    receiver_errors = []
     try:
         node = LaserWindowAnalyzer()
+        executor = SingleThreadedExecutor(context=node.context)
+        executor.add_node(node)
+
+        def receive_messages():
+            try:
+                executor.spin()
+            except ExternalShutdownException:
+                pass
+            except Exception as error:
+                receiver_errors.append(error)
+                node.inputs.ready.set()
+
+        receiver = threading.Thread(target=receive_messages, name='ros-input', daemon=True)
+        receiver.start()
+        next_tick = time.monotonic()
         while rclpy.ok() and not node.exit_requested and not stop_requested:
-            rclpy.spin_once(node, timeout_sec=0.1)
+            node.inputs.ready.wait(timeout=0.01)
+            node.inputs.ready.clear()
+            if receiver_errors:
+                raise RuntimeError('ROS 接收线程异常，停止控制') from receiver_errors[0]
+            node.process_pending_inputs()
+            if time.monotonic() >= next_tick:
+                node._tick()
+                next_tick = time.monotonic() + 0.05
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         if node is not None:
             if rclpy.ok():
                 node.publish_stop()
+            if executor is not None:
+                executor.shutdown()
+            if receiver is not None:
+                receiver.join()
             node.destroy_node()
         if node is not None and node.windows_created:
             try:

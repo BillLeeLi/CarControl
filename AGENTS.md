@@ -26,6 +26,8 @@
 | `process_node/` | 本次作业主要修改范围，Python ROS 2 包 |
 | `process_node/process_node/process_node.py` | 传感器订阅、`process_core`、控制发布、图像显示 |
 | `process_node/process_node/perception.py` | 无 ROS 依赖的测距处理、候选通道和直线车体扫掠检查 |
+| `process_node/process_node/corridor.py` | 真实墙线拟合、中线、里程计平移/转动补偿、回正/回中参考及限时降级 |
+| `process_node/process_node/input_buffer.py` | 独立接收线程与主线程之间的有界里程计缓存、最新扫描和真实接收时间 |
 | `process_node/process_node/motion.py` | 独立里程计位姿差分、滤波、局部运动状态和按激光时间关联 |
 | `process_node/process_node/control.py` | 统一参考/反馈/控制量及诊断接口，保留旧比例映射/固定动力适配器 |
 | `process_node/process_node/pid_controller.py` | 方向 PD、前进速度 PI、斜坡、抗积分饱和、限幅与变化率限制 |
@@ -69,7 +71,7 @@
 - 文档和当前 bag 使用 `/scan`；部分旧源码和建图配置仍使用 `/urg_node/scan`。应检查实际话题，通过参数或重映射适配，不能假设两个名字相同。
 - 雷达角度单位为弧度，距离为米：`theta_i = angle_min + i * angle_increment`。课程说明前方为 +x、左侧为 +y，扫描约 360°；仍应读取每帧元数据并核实安装方向。前方扇区可能跨越扫描数组首尾。
 - 原始模板的 `Angle_increment = 1`、`Middle_angle = 540` 是硬编码；现有基线已改为读取每帧真实角度、处理数组首尾和无效测距。`target` 日志为真实角度（度），不再把下标称为角度。
-- 当前 `midterm-inf-v2` 保留原始 `ranges`，将 `+inf` 作为受限无回波参与规划（默认 5 m，受 range_max 限制，0 可禁用），不与 NaN、零值或未扫描方向混同。默认整帧真实有限回波比例至少 5%，全无有限回波仍停止。候选在前向角度空间生成并包含 0°，绿色开口仅供诊断；净空达前瞻要求后不再额外奖励。日志区分窗口内 finite/support/no_return，蓝色标记为无回波上限，红色为其他无效/未知。走廊中线和按里程计补偿历史方向仍待实现。
+- 当前 `midterm-corridor-v3.1` 延续受限无回波规划：保留原始 ranges，+inf 默认最多 5 m，受 range_max 限制，0 可禁用；不与 NaN、零值或未扫描方向混同，整帧默认至少 5% 真实有限回波。候选覆盖前向及 0°，绿色开口仅供诊断。corridor 模式另加入精确走廊参考，只选参考附近合格候选。蓝色为无回波上限，红色为其他无效/未知，棕色/紫色为墙线/中线模型，青色为活动目标。
 - `Control.steer`、`Control.speed` 均为 `int16`。底层节点将二者打包后原样发送；`speed` 是动力控制量，不是 m/s，`steer` 也不是已知车轮转角。中位、正负、范围和响应需逐车标定。
 - 现有 `encoder_imu_node.py` 的 `odom.twist.twist.linear` 使用速度差填写，不应未经核验当作真实线速度。当前 `motion.py` 已用独立里程计位置/姿态与消息时间差估速和角速度；不要因此修改底层包。默认要求坐标系 `odom` → `base_link`、有效反馈接收未超时且与激光时间接近；具体参数见 `baseline.yaml`。
 
@@ -123,7 +125,11 @@ ros2 topic echo /process_node/control
 
 播放结束后订阅节点继续等待，独立单调时钟定时器处理输入超时和窗口事件，超时输出配置的停止值。按 q、Esc、点击任一窗口关闭按钮或 Ctrl+C 可退出；无图形桌面可关闭可视化。
 
-当前实现包含感知、独立运动反馈和方向 PD/前进速度 PI。默认 `control_mode=closed_loop`、`reference_mode=perception`、`target_speed_mps=0.2`，`ControlInput` 将局部目标及关联反馈交给控制器；包含目标速度斜坡、积分限幅/条件积分抗饱和、输出限幅和变化率限制。首个有效输入 `CONTROL_WARMUP` 保持停止，下一消息建立有效 dt 后运行。反馈失效、超时、时间异常、无通道或零目标速度直接停止并重置控制历史，停止覆盖普通平滑逻辑。闭环强制要求有效反馈；仅在 `control_mode=baseline` 下可关闭 `require_motion_feedback` 供离线对照。`reference_mode=straight` 仅接受合格的 0°候选，用于转向中位/速度 PI 测试，不锁定全局航向。控制符号、动力前馈及增益尚未实车标定；控制参数启动时读取，修改后需重启。90°转弯、S 弯、终点、走廊中线和实际弯曲路径检查仍待实现，不能用录制回放证明实车稳定性。
+输入由独立 ROS 接收线程写入 input_buffer：里程计最多 200 条，AllSensor 只保留最新待处理帧。主线程先批量更新反馈，再计算控制和操作 GTK；单调时钟定时器只唤醒主线程，GUI 不可移到 ROS 工作线程。真实接收时间不能用处理时间代替，发布前重新检查新鲜度，缓冲溢出停止并重建反馈。GUI 默认最多 10 Hz，不重复传输同一画面，按键/关闭持续处理。input_skipped_scans 是主动替换的中间扫描数；禁止通过放宽 0.15 s 对齐容差来掩盖 GUI 导致的里程计积压。后续实时验证必须覆盖 GUI 开启场景。
+
+当前默认 `control_mode=closed_loop`、`reference_mode=corridor`、`target_speed_mps=0.2`。`corridor.py` 仅用真实有限点，通过网格采样、固定种子 RANSAC 和正交最小二乘拟合墙线；双墙按平行、宽度和运动补偿后的历史一致性筛选，默认连续确认 3 帧。中线保存于 odom 坐标系，补偿平移和转动后融合，按走廊航向和有符号横向偏移生成参考。单墙依赖近期双墙宽度，默认最多 0.6 s；无墙历史默认最多 0.3 s/0.2 m，过期重新确认。单墙、保持或较大误差时请求速度减半；参考附近默认 ±5°无合格候选则 CRUISE_BLOCKED 停止，不自动转向侧向开口。安装平移、拟合、门控、目标点和降速参数均为 corridor_ 前缀。
+
+`ControlInput` 将参考与关联反馈交给方向 PD/前进速度 PI，包含速度斜坡、抗积分饱和、限幅及变化率限制。有效输入恢复后 CONTROL_WARMUP 停止一帧，异常/超时/受阻/零请求覆盖正常平滑并重置控制历史，输入或运动异常还清除巡航参考。corridor 强制 closed_loop 和有效反馈；旧评分对照用 reference_mode=perception，只有 baseline+perception 下可关闭反馈门控。straight 只接受合格 0°，用于中位/速度 PI 测试，不保持全局航向。控制符号、安装偏移、前馈和增益待实车标定，参数修改需重启。90°转弯、S 弯、终点及实际弯曲轨迹检查仍待实现，直走廊稳定回中也需实车验证。
 
 ## 实车运行与录制
 

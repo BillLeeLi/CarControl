@@ -23,6 +23,7 @@ def node():
     node = LaserWindowAnalyzer(
         context=context, namespace='/baseline_test',
         parameter_overrides=[Parameter('show_visualization', value=False),
+                             Parameter('reference_mode', value='perception'),
                              Parameter('control_mode', value='baseline'),
                              Parameter('require_motion_feedback', value=False)])
     yield node
