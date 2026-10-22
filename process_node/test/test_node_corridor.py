@@ -64,6 +64,14 @@ def test_default_corridor_confirms_then_warms_up_and_controls(node):
     assert node.last_control_input.reference.reference_id == 'corridor'
 
 
+def test_skipped_scans_do_not_restart_cruise_or_controller(node):
+    start(node)
+    for t in (100.64, 100.98, 101.32, 101.66):
+        tick(node, t)
+        assert node.last_corridor.status == 'CORRIDOR_TRACKING'
+        assert node.status == 'OK'
+
+
 @pytest.mark.parametrize('y,yaw', [(.2, 0.0), (0.0, math.radians(10))])
 def test_lateral_or_heading_error_generates_right_correction(node, y, yaw):
     start(node, y, yaw)

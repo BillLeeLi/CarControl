@@ -176,7 +176,7 @@ ros2 topic info /process_node/control --verbose
 
 时间阈值、滤波和跳变检查参数见 `config/baseline.yaml` 及 README；完整 bag 回放需保留独立里程计话题。
 
-当前版本标签为 `midterm-exits-v4`，默认 `control_mode=closed_loop`、`reference_mode=corridor`，由走廊走向和横向偏移生成目标，再执行方向 PD 与速度 PI；新增出口诊断不参与控制。正常物理请求速度 `target_speed_mps=0.2`，单墙、历史保持或较大偏差时默认减半。先连续 3 帧确认双墙，再由控制器预热一帧。停止、传感器/反馈失效或时间异常会清空相应控制历史，超时/异常也会清除走廊参考和出口缓存。corridor 仅支持 closed_loop 和有效独立反馈；仅离线观察激光时需同时设置 `reference_mode=perception`、`control_mode=baseline`、`require_motion_feedback=false`，仍不能连接实车驱动使用。
+当前版本标签为 `midterm-exits-v4.1`，默认 `control_mode=closed_loop`、`reference_mode=corridor`，由走廊走向和横向偏移生成目标，再执行方向 PD 与速度 PI；新增出口诊断不参与控制。正常物理请求速度 `target_speed_mps=0.2`，单墙、历史保持或较大偏差时默认减半。先连续 3 帧确认双墙，再由控制器预热一帧。停止、传感器/反馈失效或时间异常会清空相应控制历史，超时/异常也会清除走廊参考和出口缓存。corridor 仅支持 closed_loop 和有效独立反馈；仅离线观察激光时需同时设置 `reference_mode=perception`、`control_mode=baseline`、`require_motion_feedback=false`，仍不能连接实车驱动使用。
 
 首次中位/速度 PI 测试可用 `reference_mode=straight` 和较低的 `target_speed_mps`。straight 只接受合格的 0°候选，不锁定全局航向。完成基础标定后，以 `reference_mode=corridor` 在直走廊低速检查回正与回中；`reference_mode=perception` 保留上一版局部评分供离线对照。可用 `ros2 run` 的 ROS 参数覆盖，具体命令见 README。launch 的启动参数仍是 config、use_sim_time、show_visualization，其他参数通过 YAML 配置。
 
@@ -187,6 +187,8 @@ ros2 topic info /process_node/control --verbose
 - 新增 `corridor.py` 及整套 `corridor_*` 参数，必须连同新 YAML 迁移。`corridor_sensor_x_m/y_m` 是雷达相对 odom 子坐标系原点的安装平移，默认 0；雷达偏航仍由原 `sensor_yaw_offset_deg` 设置。核验走廊方向 `axis`、中线在左为正的 `center_left`、观测宽度 `width`，确保安装偏移不会被误当成车辆偏离中线。
 - 墙线拟合范围、网格、支持点数/跨度/误差、平行与宽度约束、历史跳变门槛及失效期限，见 README 的走廊参数表。墙线只使用真实回波；离群点只在拟合中排除，仍参与碰撞检查。单墙依赖近期双墙宽度，最多 0.6 s；双墙均缺失时默认最多保持 0.3 s，过期后重新确认。
 - 新增 `exits.py`、`exit_*` 参数和 `tools/analyze_exits.py`，随整个包迁移，不增加第三方依赖或 launch 参数。出口使用同一组 `corridor_sensor_x_m/y_m` 安装平移。默认至少 1.0 m 可见入口、1.0 m 纵深、15% 纵深可见比例，真实边界证据及连续 3 帧 / 0.15 s 才确认；几何阈值需按现场观测核对。接近走廊坐标最多保持 3 s / 2 m，入口丢失最多保留编号 0.5 s / 0.5 m，这些是诊断期限，不放宽原控制保护。
+- v4.1 加入 `exit_corner_*` 参数：默认在真实墙端旁检查侧偏 20–85°、超出墙端 0.6 m 的连续可见区域；测距跳变 0.7 m、墙端邻域半径 0.6 m、真实线段跨度至少 0.35 m。橙色圆圈/箭头与 `SUSPECTED` 是疑似线索，永不直接参与建议/控制；之后形成标准入口时，以 1.2 m / 60° 容差关联原编号，但仍要重新确认。无可信接近坐标时为 `EXIT_HINTS_ONLY`，仅相对车头划分左右，不假设道路宽度。须连同新 YAML 迁移；关闭此诊断可设 exit_corner_enabled=false。
+- 巡航参考已改为先验证当前帧观测，再应用历史保持期限。有效一致双墙不再因超过无墙保持 0.3 s 而重建；单墙仍受距最近双墙 0.6 s 限制，真正无观测仍受 0.3 s / 0.2 m 限制。时间回跳、超过 0.5 s 的扫描间隔、输入/反馈超时依然重置。日志增加 scan_dt、fitted_walls，分别表示相邻处理扫描的消息时间差及本帧已拟合墙数；ACQUIRING 时未画模型不表示本帧没找到墙。
 - 黄色入口、`E编号`、白圈和 `suggestion` 仅供诊断，青色仍是获准控制目标；路口出现已确认出口但 `CORRIDOR_LOST` 停车是本阶段预期行为。顺时针路线默认建议右侧，其次前向/左侧；未确认及 HELD 不参与建议。宽房门/房间可能满足几何条件，不能仅凭建议自动转向。短 Z 形不要求回中或全局冷却，但入口仍须可见；路径衔接及弯曲车体检查尚未实现。图例、全参数、有限时段离线分析命令见 README“道路出口识别与追踪”。
 - 里程计坐标系和消息时间；低速前进的 `v` 应为正、倒退为负，静止应接近零，航向及位置尺度需核验。
 - 转向中位、正负方向、幅度、增益，以及动力值和停止值；`steer` 和 `speed` 均是底层控制量，不直接等于转角和 m/s。
@@ -216,6 +218,8 @@ ros2 topic info /process_node/control --verbose
 | `CONTROL_TIME_INVALID`/`CONTROL_TIME_GAP` | 检查激光时间戳是否重复、回跳或间隔过长；控制器已停止并清空历史 |
 | `NO_STRAIGHT_PATH` | straight 测试没有合格的 0°候选；不应通过强制前进绕过感知检查 |
 | `CORRIDOR_ACQUIRING`/`CORRIDOR_LOST` | 检查真实墙线是否有足够跨度、双墙是否平行及宽度是否合理；初始化需连续确认，不能仅增大保持时间让车盲走 |
+| 直道反复 `CORRIDOR_ACQUIRING` | v4.1 已修正 0.3 s 无墙期限误用；若 scan_dt 仍超过 0.5 s，应检查实际输入间隔。课程 bag 后段 AllSensor 录制时间存在长间隔/成批到达，独立 /scan 连续，不能仅凭独立扫描的离线结果断言整条实时链路正常 |
+| `SUSPECTED`/`EXIT_HINTS_ONLY` | 真实墙端旁的疑似斜向开口，没有形成标准入口/可信接近走廊；不直接生成右转控制 |
 | `CORRIDOR_SINGLE_WALL`/`CORRIDOR_HOLD` | 参考正在限时降速；观察缺失侧、观测年龄、双墙年龄，过期后停止是预期行为 |
 | `CRUISE_BLOCKED` | 有其他候选但参考附近不可通行；本轮没有自动绕障接管，不应改成直接追逐侧向开口 |
 | `CORRIDOR_OUT_OF_RANGE`/`CORRIDOR_TIME_INVALID` | 巡航纠偏角超出范围，或激光时间不连续；核对安装、位姿与扫描时间，不直接取消限幅 |
@@ -232,3 +236,5 @@ ros2 topic info /process_node/control --verbose
 v3.1 调度修复通过 **181 项测试**。在用户相同的 VS Code/X11 图形环境中开启真实窗口回放约 30 s，316 帧反馈全部有效、无未对齐，关联差约 ±13 ms；10–30 秒处理的 211 帧均正常控制。主动替换 35 个中间扫描以处理最新观测，播放停止后超时停车并正常退出。此前只关闭 GUI 做实时验证未覆盖图形转发负载，本次补充了该条件；以上仍非实车结果。
 
 2026-10-22 出口诊断 v4 已构建，通过 **213 项功能测试**。覆盖前方开放时右侧分支、双侧丁字路口、斜向拐角、窄门洞/未知/无回波、障碍、短 Z 形反向出口、odom 关联与期限，及开关诊断时控制结果一致性。课程独立 /scan 的局部片段观察到右侧及先左后右出口的连续确认，四段仅读取约 22 MB 小消息载荷；详细统计和局限见 README。开启真实图形窗口 AllSensor 回放约 20 s，182 帧反馈均有效，窗口正常，无未对齐；未在助教设备或实车验证，也未实现自动转弯。
+
+v4.1 通过 **226 项功能测试**并构建成功。真实直道 298–310 s，每四帧处理一帧、保留全部里程计：旧版 24 帧 ACQUIRING / 12 帧 TRACKING，新版 2 / 34；覆盖过期保护仍有效的回归测试。三角形拐角片段约 281.88 s 已报告右前方 SUSPECTED，约 284.13 s 截图位置仍可见；不代表完成转弯。开启真实 GUI 回放后段处理 64 帧，反馈全部有效，但处理扫描间隔最大约 0.92 s，仍触发 0.5 s 保护重建；该录制的 AllSensor 在 298–313 s 有 11 次记录间隔超过 0.5 s（最大约 0.94 s），独立 /scan 最大间隔约 0.097 s。阈值未放宽，不能宣称这段 AllSensor 实时输出已完全连续；无助教设备或实车验证。

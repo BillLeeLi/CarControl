@@ -49,7 +49,7 @@ class LaserWindowAnalyzer(Node):
             }
         )
         self.declare_parameter("sensorTopic", "/sync_store_node/allsensor")
-        self.declare_parameter("group_label", "midterm-exits-v4")
+        self.declare_parameter("group_label", "midterm-exits-v4.1")
         self.declare_parameter("show_visualization", True)
         self.declare_parameter("control_mode", "closed_loop")
         self.declare_parameter("reference_mode", "corridor")
@@ -150,6 +150,7 @@ class LaserWindowAnalyzer(Node):
         self.previous_target = None
         self.last_received = None
         self.last_stamp_ns = None
+        self.scan_gap_s = None
         self.last_feedback = self.motion.feedback()
         self.last_control_input = None
         self.last_command = self.controller.stop("WAITING", "等待输入")
@@ -333,7 +334,10 @@ class LaserWindowAnalyzer(Node):
         result = self.last_plan
         if self.last_corridor is not None:
             estimate = self.last_corridor
-            control_text += f' | corridor={estimate.status} confidence={estimate.confidence:.2f}'
+            control_text += (f' | corridor={estimate.status} confidence={estimate.confidence:.2f}'
+                             f' fitted_walls={len(estimate.observed_walls)}')
+            if self.scan_gap_s is not None:
+                control_text += f' scan_dt={self.scan_gap_s:.3f}s'
             if estimate.heading_rad is not None:
                 control_text += (
                     f' axis={math.degrees(estimate.heading_rad):+.2f}deg'
@@ -348,6 +352,7 @@ class LaserWindowAnalyzer(Node):
                 f'#{t.track_id}:{t.side}:{t.state}@({t.observation.center_xy[0]:.2f},'
                 f'{t.observation.center_xy[1]:.2f})'
                 f'/{math.degrees(t.observation.heading_rad):+.0f}deg'
+                f'/kind={t.observation.role}'
                 f'/w={t.observation.width_m:.2f}/deep={t.observation.depth_visible_ratio:.0%}'
                 f'/age={t.age_s:.2f}'
                 for t in exits.tracks)
@@ -504,6 +509,7 @@ class LaserWindowAnalyzer(Node):
         self.plan_revision += 1
         stamp = urg.header.stamp
         stamp_ns = stamp.sec * 10**9 + stamp.nanosec
+        self.scan_gap_s = None if self.last_stamp_ns is None else (stamp_ns-self.last_stamp_ns)*1e-9
         if self.last_stamp_ns is not None and stamp_ns < self.last_stamp_ns:
             self.previous_target = None
             self.controller.reset()

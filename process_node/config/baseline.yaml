@@ -2,7 +2,7 @@
 /**:
   ros__parameters:
     sensorTopic: /sync_store_node/allsensor
-    group_label: midterm-exits-v4
+    group_label: midterm-exits-v4.1
     show_visualization: true
     input_odom_queue_size: 200  # 独立接收线程的有界缓存；主线程先批量更新里程计
     visualization_period_s: 0.1  # 最多 10 Hz 刷新图像，窗口/按键事件仍持续处理
@@ -104,6 +104,16 @@
     exit_context_travel_m: 2.0
     exit_max_update_gap_s: 0.5
     exit_prefer_right: true
+    # 墙端旁斜前方开口只标为 SUSPECTED，不参与路线建议或控制。
+    exit_corner_enabled: true
+    exit_corner_min_angle_deg: 20.0
+    exit_corner_max_angle_deg: 85.0
+    exit_corner_depth_m: 0.6
+    exit_corner_jump_m: 0.7
+    exit_corner_wall_radius_m: 0.6
+    exit_corner_wall_span_m: 0.35
+    exit_corner_match_distance_m: 1.2
+    exit_corner_match_angle_deg: 60.0
     steer_center: 0
     steer_limit: 600
     # 以下两项仅在 control_mode=baseline 时使用。

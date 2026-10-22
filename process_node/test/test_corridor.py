@@ -145,6 +145,37 @@ def test_large_unobserved_translation_expires_history():
     assert not tracker.update(missing, feedback(x=.3), round(1.3e9)).usable
 
 
+@pytest.mark.parametrize('dt', [.31, .34, .49])
+def test_fresh_consistent_pairs_do_not_expire_when_intermediate_scans_are_skipped(dt):
+    tracker = CorridorTracker()
+    confirm(tracker)
+    for i in range(1, 10):
+        # 新双墙通过门控，不能仅因超过无墙保持期限而反复重新确认。
+        result = tracker.update(data(), feedback(x=i*.1), round((1.2+i*dt)*1e9))
+        assert result.status == 'CORRIDOR_TRACKING'
+        assert result.measurement_age_s == 0.
+
+
+def test_fresh_single_wall_updates_observation_but_not_old_width_deadline():
+    tracker = CorridorTracker()
+    confirm(tracker)
+    scan = scene()
+    scan.ranges[np.sin(np.arange(len(scan.ranges))*scan.angle_increment) < 0] = np.inf
+    single = prepare_scan(scan, PlannerConfig())
+    assert tracker.update(single, feedback(), round(1.54e9)).status == 'CORRIDOR_SINGLE_WALL'
+    assert not tracker.update(single, feedback(), round(1.88e9)).usable
+
+
+def test_large_scan_gap_and_already_expired_history_still_require_confirmation():
+    tracker = CorridorTracker()
+    confirm(tracker)
+    assert tracker.update(data(), feedback(), round(1.8e9)).status == 'CORRIDOR_ACQUIRING'
+    confirm(tracker, start=2.)
+    missing = prepare_scan(make_scan(ranges=np.full(1440, np.nan)), PlannerConfig())
+    assert not tracker.update(missing, feedback(), round(2.55e9)).usable
+    assert tracker.update(data(), feedback(), round(2.65e9)).status == 'CORRIDOR_ACQUIRING'
+
+
 def test_width_or_center_jump_does_not_immediately_change_reference():
     tracker = CorridorTracker()
     confirm(tracker)

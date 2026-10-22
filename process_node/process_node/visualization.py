@@ -136,10 +136,16 @@ def draw_laser(result, config, status, steer, speed, label, command=None, corrid
             direction = np.array([math.cos(obs.heading_rad), math.sin(obs.heading_rad)])
             normal = np.array([-direction[1], direction[0]])
             color = (80, 220, 255) if track.state == 'CONFIRMED' else (110, 135, 155)
+            if track.state == 'SUSPECTED':
+                color = (0, 150, 255)
             if track.state == 'HELD':
                 color = (100, 100, 100)
-            cv2.line(image, pixel(*(center-normal*obs.width_m/2)),
-                     pixel(*(center+normal*obs.width_m/2)), color, 2)
+            if obs.role == 'CORNER_HINT':
+                # 圆圈标真实墙端；不把开口弦宽画成已测量的入口截面。
+                cv2.circle(image, pixel(*center), 5, color, 2)
+            else:
+                cv2.line(image, pixel(*(center-normal*obs.width_m/2)),
+                         pixel(*(center+normal*obs.width_m/2)), color, 2)
             cv2.arrowedLine(image, pixel(*center), pixel(*(center+direction*.6)), color, 2)
             if track.track_id == exits.preferred_id:
                 cv2.circle(image, pixel(*center), 8, (240, 240, 240), 2)
@@ -148,7 +154,7 @@ def draw_laser(result, config, status, steer, speed, label, command=None, corrid
                         .42, color, 1, cv2.LINE_AA)
         _text(image, f'exits={exits.status}  suggested={exits.preferred_id}'
               f' {exits.recommendation}', 914, (80, 220, 255))
-        _text(image, 'yellow exits: diagnostic only; white ring: route suggestion, not control', 936)
+        _text(image, 'yellow: confirmed | orange S: suspected only | white ring: suggestion', 936)
         for row, track in enumerate(exits.tracks[:4]):
             obs = track.observation
             _text(image, f'E{track.track_id} {track.side} {track.state}'

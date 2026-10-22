@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from process_node.corridor import CorridorEstimate
-from process_node.exits import ExitConfig, ExitTracker
+from process_node.exits import ExitConfig, ExitObservation, ExitTracker
 from process_node.perception import PlannerConfig, prepare_scan
 from test_corridor import feedback
 from test_perception import make_scan
@@ -92,6 +92,73 @@ def test_left_only_geometry_is_reported_without_enforcing_right_turn_everywhere(
 def test_narrow_doorway_is_not_a_side_road():
     result = sequence(ExitTracker(), road(opening=(1.5, 2.2)))
     assert not any(t.side == 'RIGHT' for t in result.tracks)
+
+
+def triangle(pose=(0., 0., 0.), mirror=False):
+    # 侧墙向外展开后结束，出口先出现在斜前方；不是标准平行墙侧向通道。
+    walls = [((-6, 1.1), (5, 1.1)), ((-6, -1.5), (1., -1.5)),
+             ((1., -3.5), (4.8, .2))]
+    if mirror:
+        walls = [((a[0], -a[1]), (b[0], -b[1])) for a, b in walls]
+    return raycast(walls, pose=pose)
+
+
+@pytest.mark.parametrize('mirror,side', [(False, 'RIGHT'), (True, 'LEFT')])
+def test_wall_endpoint_reveals_diagonal_hint_before_standard_side_portal(mirror, side):
+    scan = triangle(mirror=mirror)
+    old = sequence(ExitTracker(ExitConfig(corner_enabled=False)), scan)
+    assert not any(t.side == side for t in old.tracks)
+    result = sequence(ExitTracker(), scan)
+    hint = next(t for t in result.tracks if t.side == side)
+    assert hint.state == 'SUSPECTED'
+    assert hint.observation.role == 'CORNER_HINT'
+    assert not hint.observation.structural
+    assert result.preferred_id != hint.track_id
+
+
+def test_hints_without_corridor_never_confirm_or_recommend_even_after_many_frames():
+    tracker = ExitTracker()
+    for i in range(10):
+        result = tracker.update(triangle(), feedback(), round((1+i*.1)*1e9))
+        assert result.status == 'EXIT_HINTS_ONLY'
+        assert result.preferred_id is None
+        assert all(t.state == 'SUSPECTED' and t.observation.role == 'CORNER_HINT'
+                   for t in result.tracks)
+
+
+@pytest.mark.parametrize('yaw', [math.radians(170), math.radians(-170)])
+def test_hint_geometry_across_scan_seam_keeps_side_in_approach_frame(yaw):
+    pose = (0., 0., yaw)
+    result = sequence(ExitTracker(), triangle(pose), pose=pose)
+    assert any(t.side == 'RIGHT' and t.state == 'SUSPECTED' for t in result.tracks)
+
+
+def test_hint_upgrade_keeps_id_and_requires_new_standard_confirmation(monkeypatch):
+    hint = ExitObservation((1., -1.5), math.radians(-40), 1.1, .6,
+                           'CORNER_HINT', False, 8, .4)
+    portal = ExitObservation((1.5, -1.3), math.radians(-90), 1.2, 1., 'SIDE', True, 15, .8)
+    current = [hint]
+    monkeypatch.setattr('process_node.exits.detect_exits', lambda *args: current)
+    tracker = ExitTracker()
+    before = sequence(tracker)
+    identifier = before.tracks[0].track_id
+    current[:] = [portal]
+    for t in (1.3, 1.4):
+        result = tracker.update(road(), feedback(), round(t*1e9), corridor())
+        assert result.tracks[0].track_id == identifier
+        assert result.tracks[0].state == 'TENTATIVE'
+        assert result.preferred_id is None
+    result = tracker.update(road(), feedback(), round(1.5e9), corridor())
+    assert result.tracks[0].state == 'CONFIRMED'
+    assert result.preferred_id == identifier
+
+
+def test_hint_state_is_discarded_with_invalid_motion():
+    tracker = ExitTracker()
+    tracker.update(triangle(), feedback(), 10**9)
+    result = tracker.update(triangle(), feedback(valid=False), round(1.1e9))
+    assert result.status == 'EXIT_INPUT_INVALID'
+    assert not result.tracks
 
 
 def test_t_junction_with_both_sides_open_prefers_right():

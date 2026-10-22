@@ -26,10 +26,11 @@ def main():
     parser.add_argument('database', type=Path, help='一个 rosbag SQLite .db3 文件')
     parser.add_argument('--offset', type=float, default=0., help='相对 bag 起点的秒数')
     parser.add_argument('--duration', type=float, default=30., help='分析时长，最多 120 秒')
+    parser.add_argument('--scan-stride', type=int, default=1, help='每 N 帧扫描处理一帧，里程计不跳过')
     parser.add_argument('--output', type=Path, required=True, help='仓库外的结果目录')
     args = parser.parse_args()
-    if not 0 < args.duration <= 120 or args.offset < 0:
-        parser.error('duration 应在 (0, 120] 秒内，offset 应非负')
+    if not 0 < args.duration <= 120 or args.offset < 0 or args.scan_stride < 1:
+        parser.error('duration 应在 (0, 120] 秒内，offset 应非负，scan-stride 应为正整数')
     args.output.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(args.database.resolve().as_uri() + '?mode=ro', uri=True)
     try:
@@ -53,10 +54,13 @@ def main():
         states, recommendations = Counter(), Counter()
         count, payload, last_picture = 0, 0, -1e9
         previous_signature = None
+        previous_stamp = None
+        seen_scans = 0
         costs = []
         with (args.output/'frames.csv').open('w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(['bag_s', 'odom', 'corridor', 'exits', 'suggestion', 'preferred_id', 'tracks'])
+            writer.writerow(['bag_s', 'odom', 'corridor', 'exits', 'suggestion', 'preferred_id', 'tracks',
+                             'scan_dt_s', 'fitted_walls', 'corridor_reason', 'yaw_deg'])
             for timestamp, topic, blob in rows:
                 payload += len(blob)
                 received = (timestamp-start)*1e-9
@@ -67,6 +71,9 @@ def main():
                         corridor.reset()
                         tracker.reset()
                     continue
+                seen_scans += 1
+                if (seen_scans-1) % args.scan_stride:
+                    continue
                 scan = deserialize_message(blob, LaserScan)
                 stamp = scan.header.stamp.sec*10**9+scan.header.stamp.nanosec
                 feedback = motion.feedback(stamp, now=received)
@@ -76,6 +83,8 @@ def main():
                 result = tracker.update(data, feedback, stamp, estimate)
                 costs.append((time.perf_counter()-before)*1000)
                 descriptions = [dict(id=t.track_id, side=t.side, state=t.state,
+                                     kind=t.observation.role,
+                                     heading_deg=round(float(np.degrees(t.observation.heading_rad)), 2),
                                      x=round(t.observation.center_xy[0], 3),
                                      y=round(t.observation.center_xy[1], 3),
                                      width=round(t.observation.width_m, 3),
@@ -83,7 +92,11 @@ def main():
                                 for t in result.tracks]
                 writer.writerow([received, feedback.status, estimate.status, result.status,
                                  result.recommendation, result.preferred_id,
-                                 json.dumps(descriptions)])
+                                 json.dumps(descriptions),
+                                 '' if previous_stamp is None else (stamp-previous_stamp)*1e-9,
+                                 len(estimate.observed_walls), estimate.reason,
+                                 '' if feedback.state is None else np.degrees(feedback.state.yaw_rad)])
+                previous_stamp = stamp
                 count += 1
                 states[result.status] += 1
                 recommendations[result.recommendation] += 1
@@ -97,7 +110,7 @@ def main():
                     cv2.imwrite(str(args.output/f'exits_{received:.2f}s.png'), picture)
                     last_picture = received
                 previous_signature = signature
-        summary = dict(scans=count, payload_bytes=payload, status=dict(states),
+        summary = dict(scans=count, scan_messages=seen_scans, payload_bytes=payload, status=dict(states),
                        suggestions=dict(recommendations),
                        perception_ms_median=float(np.median(costs)) if costs else None,
                        perception_ms_p95=float(np.percentile(costs, 95)) if costs else None,

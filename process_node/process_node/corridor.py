@@ -325,18 +325,38 @@ class CorridorTracker:
             self.reset()
         self._last_scan_ns = stamp_ns
         cfg = self.config
-        # 历史一旦过期就不能被一帧新观测复活，必须重新通过连续双墙确认。
+        prediction = self._to_body(self._model, pose) if self._model is not None else None
+        walls = fit_walls(data, cfg)
+        pair = self._pair(walls, prediction)
+        # 先验证当前真实观测，再判断是否需要沿用旧模型。处理最新帧时可能跳过
+        # 中间扫描；0.34 s 后收到可信双墙并不等于“无墙保持了 0.34 s”。
+        # 时间回跳/大扫描间隔已在上面处理，双墙仍须通过运动补偿后的几何门控。
         if self._model is not None:
             age = (stamp_ns - self._last_observation_ns) * 1e-9
             pair_age = (stamp_ns - self._last_pair_ns) * 1e-9
             travel = np.linalg.norm(np.array(pose[:2]) - self._last_observation_xy)
-            if (age > cfg.hold_timeout_s or pair_age > cfg.single_wall_timeout_s
-                    or travel > cfg.max_unobserved_travel_m):
+            choices = []
+            if pair is None and pair_age <= cfg.single_wall_timeout_s:
+                for wall in walls:
+                    # 单墙有新观测，但宽度来自旧双墙，不能突破双墙年龄期限。
+                    side = 1 if wall.offset_m > 0 else -1
+                    measured = (wall.heading_rad,
+                                wall.offset_m - side * prediction[2] / 2, prediction[2])
+                    if self._consistent(measured, prediction):
+                        choices.append((wall.span_m - abs(measured[1] - prediction[1]), measured))
+            if choices:
+                _, measured = max(choices, key=lambda item: item[0])
+                self._accept(measured, pose, stamp_ns, self._confidence * 0.8, pair=False)
+                return self._estimate('CORRIDOR_SINGLE_WALL', '单墙结合近期双墙宽度，限时降速',
+                                      pose, stamp_ns, walls)
+            if pair is None and (age > cfg.hold_timeout_s
+                                 or pair_age > cfg.single_wall_timeout_s
+                                 or travel > cfg.max_unobserved_travel_m):
+                # 本帧既无一致双墙，也无可用单墙，才应用历史保持期限。
+                # 清除后只能重新连续确认；不允许旧模型被无证据地续期。
                 self._model = self._pending = None
                 self._confirmations = 0
-        prediction = self._to_body(self._model, pose) if self._model is not None else None
-        walls = fit_walls(data, cfg)
-        pair = self._pair(walls, prediction)
+                pair = self._pair(walls, None)
         if pair is not None:
             _, measured, quality = pair
             if self._model is None:
@@ -352,19 +372,6 @@ class CorridorTracker:
             return self._estimate('CORRIDOR_TRACKING', '双墙走向、宽度及历史一致性通过',
                                   pose, stamp_ns, walls)
         if self._model is not None:
-            choices = []
-            for wall in walls:
-                # 单墙只能利用近期双墙建立的宽度，不凭一个任意墙面初始化中线。
-                side = 1 if wall.offset_m > 0 else -1
-                measured = (wall.heading_rad,
-                            wall.offset_m - side * prediction[2] / 2, prediction[2])
-                if self._consistent(measured, prediction):
-                    choices.append((wall.span_m - abs(measured[1] - prediction[1]), measured))
-            if choices:
-                _, measured = max(choices, key=lambda item: item[0])
-                self._accept(measured, pose, stamp_ns, self._confidence * 0.8, pair=False)
-                return self._estimate('CORRIDOR_SINGLE_WALL', '单墙结合近期双墙宽度，限时降速',
-                                      pose, stamp_ns, walls)
             return self._estimate('CORRIDOR_HOLD', '没有一致墙面观测，短时运动补偿并降速',
                                   pose, stamp_ns, walls)
         self._pending = None
