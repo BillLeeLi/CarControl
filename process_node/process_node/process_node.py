@@ -22,6 +22,7 @@ from process_node.control import (
     BaselineControlConfig, BaselineController, ControlInput, ControlReference,
 )
 from process_node.corridor import CorridorConfig, CorridorTracker, select_cruise_candidate
+from process_node.exits import ExitConfig, ExitTracker
 from process_node.input_buffer import InputBuffer
 from process_node.motion import MotionConfig, MotionEstimator
 from process_node.pid_controller import PIDConfig, PIDController
@@ -48,7 +49,7 @@ class LaserWindowAnalyzer(Node):
             }
         )
         self.declare_parameter("sensorTopic", "/sync_store_node/allsensor")
-        self.declare_parameter("group_label", "midterm-corridor-v3.1")
+        self.declare_parameter("group_label", "midterm-exits-v4")
         self.declare_parameter("show_visualization", True)
         self.declare_parameter("control_mode", "closed_loop")
         self.declare_parameter("reference_mode", "corridor")
@@ -98,6 +99,15 @@ class LaserWindowAnalyzer(Node):
             for item in fields(corridor_defaults)
         }))
         self.last_corridor = None
+        exit_defaults = ExitConfig()
+        for item in fields(exit_defaults):
+            self.declare_parameter('exit_' + item.name, getattr(exit_defaults, item.name))
+        self.exits = ExitTracker(ExitConfig(**{
+            item.name: self.get_parameter('exit_' + item.name).value
+            for item in fields(exit_defaults)
+        }), sensor_offset=(self.corridor.config.sensor_x_m, self.corridor.config.sensor_y_m),
+            min_finite_ratio=self.config.min_scan_finite_ratio)
+        self.last_exits = None
         self.declare_parameter("sensor_timeout_s", 1.0)
         self.declare_parameter("log_period_s", 1.0)
         self.steer_center = self.get_parameter("steer_center").value
@@ -275,6 +285,7 @@ class LaserWindowAnalyzer(Node):
                 self.label,
                 command=self.last_command,
                 corridor=self.last_corridor,
+                exits=self.last_exits,
             )
 
     def _log_decision(self):
@@ -331,6 +342,17 @@ class LaserWindowAnalyzer(Node):
                     f' speed_scale={estimate.speed_scale:.2f}'
                 )
             control_text += f' ({estimate.reason})'
+        if self.last_exits is not None:
+            exits = self.last_exits
+            descriptions = ','.join(
+                f'#{t.track_id}:{t.side}:{t.state}@({t.observation.center_xy[0]:.2f},'
+                f'{t.observation.center_xy[1]:.2f})'
+                f'/{math.degrees(t.observation.heading_rad):+.0f}deg'
+                f'/w={t.observation.width_m:.2f}/deep={t.observation.depth_visible_ratio:.0%}'
+                f'/age={t.age_s:.2f}'
+                for t in exits.tracks)
+            control_text += (f' | exits={exits.status} suggestion={exits.recommendation}'
+                             f' preferred={exits.preferred_id} [{descriptions}] (diagnostic only)')
         if result is None or self.status == "STALE_DATA":
             self.get_logger().info(
                 f"[{self.label}] {self.status}：等待有效传感器输入，输出停止值 | {motion_text}"
@@ -424,6 +446,7 @@ class LaserWindowAnalyzer(Node):
                         self.last_plan, self.config, self.status, self.steer_value,
                         self.speed_value, self.label, command=self.last_command,
                         corridor=self.last_corridor,
+                        exits=self.last_exits,
                     )
                 cv2.imshow(self.LASER_WINDOW, laser)
                 self.last_gui_signature, self.last_gui_time = signature, now
@@ -447,6 +470,8 @@ class LaserWindowAnalyzer(Node):
     def _reset_corridor(self):
         self.corridor.reset()
         self.last_corridor = None
+        self.exits.reset()
+        self.last_exits = None
 
     def _corridor_plan(self, urg, stamp_ns):
         """先生成运动补偿后的巡航参考，再由原感知检查实际可执行候选。"""
@@ -520,6 +545,10 @@ class LaserWindowAnalyzer(Node):
         self.last_command = self.controller.compute(self.last_control_input)
         self.status = self.last_plan.status if target is None else self.last_command.status
         self.previous_target = target.angle if self.status in ('OK', 'CONTROL_WARMUP') else None
+        # 出口诊断与巡航目标独立：即使 CORRIDOR_LOST 停车，也可以短时观察侧向出口。
+        # 不用 preferred_id 替换当前目标；真正转弯还需要行为选择和弯曲路径检查。
+        self.last_exits = self.exits.update(
+            self.last_plan.scan, self.last_feedback, stamp_ns, self.last_corridor)
         return self.last_command.steer, self.last_command.speed
 
 def main(args=None):

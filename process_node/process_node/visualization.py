@@ -26,9 +26,9 @@ def draw_steering(image, steer, center, limit, label, status, target_angle):
     _text(image, f'target={target}  {status}', 205)
 
 
-def draw_laser(result, config, status, steer, speed, label, command=None, corridor=None):
+def draw_laser(result, config, status, steer, speed, label, command=None, corridor=None, exits=None):
     """鸟瞰图：车头向上、车体左方在屏幕左方，与翻转后的 RGB 独立。"""
-    image = np.full((900, 800, 3), 23, dtype=np.uint8)
+    image = np.full((1060 if exits is not None else 900, 800, 3), 23, dtype=np.uint8)
     origin = np.array([400.0, 500.0])
     scale = 240.0 / config.max_distance_m
 
@@ -129,7 +129,34 @@ def draw_laser(result, config, status, steer, speed, label, command=None, corrid
             _text(image, f'axis={math.degrees(heading):+.1f}deg center_left={center:+.2f}m'
                   f' width={corridor.width_m:.2f}m ref={reference}deg', 240)
 
-    # 活动目标最后画，避免巡航参考与目标重合时紫色模型线盖住青色箭头。
+    if exits is not None:
+        for track in exits.tracks:
+            obs = track.observation
+            center = np.array(obs.center_xy) - np.array(exits.sensor_offset_xy)
+            direction = np.array([math.cos(obs.heading_rad), math.sin(obs.heading_rad)])
+            normal = np.array([-direction[1], direction[0]])
+            color = (80, 220, 255) if track.state == 'CONFIRMED' else (110, 135, 155)
+            if track.state == 'HELD':
+                color = (100, 100, 100)
+            cv2.line(image, pixel(*(center-normal*obs.width_m/2)),
+                     pixel(*(center+normal*obs.width_m/2)), color, 2)
+            cv2.arrowedLine(image, pixel(*center), pixel(*(center+direction*.6)), color, 2)
+            if track.track_id == exits.preferred_id:
+                cv2.circle(image, pixel(*center), 8, (240, 240, 240), 2)
+            cv2.putText(image, f'E{track.track_id} {track.side[0]} {track.state[0]}',
+                        pixel(*(center + .15*normal)), cv2.FONT_HERSHEY_SIMPLEX,
+                        .42, color, 1, cv2.LINE_AA)
+        _text(image, f'exits={exits.status}  suggested={exits.preferred_id}'
+              f' {exits.recommendation}', 914, (80, 220, 255))
+        _text(image, 'yellow exits: diagnostic only; white ring: route suggestion, not control', 936)
+        for row, track in enumerate(exits.tracks[:4]):
+            obs = track.observation
+            _text(image, f'E{track.track_id} {track.side} {track.state}'
+                  f' w={obs.width_m:.1f}m d={obs.depth_m:.1f}m'
+                  f' deep={obs.depth_visible_ratio:.0%}'
+                  f' walls={obs.wall_points} age={track.age_s:.2f}s', 962+row*24)
+
+    # 活动目标最后画，避免参考或出口诊断覆盖青色箭头。
     if result is not None and result.target is not None and status == 'OK':
         cv2.arrowedLine(image, pixel(0, 0), ray(result.target.angle, config.lookahead_m),
                        (255, 235, 0), 3)

@@ -1,6 +1,6 @@
-# 直走廊巡航参考与低速 PD/PI 控制
+# 走廊巡航、出口诊断与低速 PD/PI 控制
 
-当前标记为 `midterm-corridor-v3.1`，默认 `control_mode=closed_loop`、`reference_mode=corridor`：从真实激光点估计走廊走向和中线，结合独立里程计补偿历史参考，生成回正/回中的目标，再运行方向 PD 和前进速度 PI。`process_core(urg)` 仍返回 `(steer, speed)`。正常请求速度为 0.2 m/s，单墙、历史保持或较大偏差时默认减半；参数尚未实车整定。90°转弯、S 弯、终点判断和实际弯曲轨迹检查仍待实现，直走廊实车稳定性仍待验证。跨设备迁移见 [MIGRATION.md](MIGRATION.md)。
+当前标记为 `midterm-exits-v4`，默认 `control_mode=closed_loop`、`reference_mode=corridor`：从真实激光点估计走廊走向和中线，结合独立里程计补偿历史参考，生成回正/回中的目标，再运行方向 PD 和前进速度 PI。新增道路出口识别和跟踪，**仅用于图像/日志诊断，不接管控制**。`process_core(urg)` 仍返回 `(steer, speed)`。正常请求速度为 0.2 m/s，单墙、历史保持或较大偏差时默认减半；参数尚未实车整定。90°转弯、S 弯、终点判断和实际弯曲轨迹检查仍待实现，直走廊实车稳定性仍待验证。跨设备迁移见 [MIGRATION.md](MIGRATION.md)。
 
 **新增行为：默认必须收到有效的独立 `/encoder_imu_node/odom`，且它与激光消息时间接近，才允许输出行驶指令。** 当前课程 bag 已包含该话题，完整回放命令不变。只有激光数据时，会输出停止值。
 
@@ -76,6 +76,60 @@ AllSensor.urg → prepare_scan → 走廊估计/运动补偿 → 巡航参考
 | `ControlCommand` | 底层 steer/speed 控制量、状态及输出原因 |
 
 默认模式将物理目标速度填入 `ControlReference.target_speed_mps`，`pid_controller.py` 实现方向 PD 与速度 PI。`control_mode=baseline` 保留旧比例转向/固定动力输出供离线对照，此时目标速度字段仍为 None，`target_speed_mps` 参数不控制旧基线的动力值。
+
+## 道路出口识别与追踪（本阶段仅诊断）
+
+2026-10-22 用户根据课程路线补充：外圈顺时针，三处大转弯是丁字路口并应右转；右下角还有三角形拐角和短 Z 形连续反向转弯。缩略图只用于理解道路拓扑，程序没有读取图中的坐标、长度或固定转弯时间。
+
+`exits.py` 独立运行于原有巡航目标之外，处理流程为：
+
+1. 从已确认双墙取得接近走廊的方向、中线和宽度，并保存到 odom 坐标。直走廊参考丢失后，出口诊断可继续使用经平移/转动补偿的接近坐标，默认最多 3 s / 2 m；这不会延长巡航控制的历史保持期限。没有初始可信双墙或接近坐标已过期时为 `EXIT_NO_CONTEXT`，不会凭默认宽度猜路。
+2. 沿走廊前方 4 m 范围探测左右入口，尝试侧向 90° 及其 ±20° 的方向假设；同时检查前向延续。**右侧出口不要求前方封闭**。若已见侧向入口，前向延续截面放在路口另一侧，避免把路口前的短直路误报成直行出口。
+3. 可见入口默认至少 1.0 m 宽，向外至少观察 1.0 m 纵深。墙角会遮挡侧向走廊深处，故入口宽度使用近截面，并单独记录能看到完整纵深的比例（默认至少 15%）。**未被看见的其余纵深仍是未知区域，不据此宣布整幅入口可通行**。`depth_visible` / 日志 `deep` 表示这个比例。
+4. 可见性使用真实有限回波及受限 `+inf`，不穿过墙、NaN、未扫描方向或插值箱；另外保留原始真实点对入口内部的障碍检查。确认还需要边界真实点数和跨度，不能仅凭一片 `inf`。触及搜索边界、超宽区域、缺少真实结构支持的开口保留为 `UNVERIFIED`。
+5. 入口中心和朝向保存于 odom 坐标，以位置及方向关联编号；短时遮挡显示 `HELD`，默认最多 0.5 s / 0.5 m。重新出现后重新连续确认，不能让旧确认无限续期。前向截面随车移动，按方向和横向位置关联，不冒充固定路口地标。
+6. 连续 3 帧且覆盖至少 0.15 s 才为 `CONFIRMED`。扫描时间重复/回跳、长间隔、反馈失效、接收超时或运动历史重置会清除相应历史。不存在转弯后的统一冷却期或“必须先回中”的门槛；新接近走廊参考建立后可以立即探测下一处反向出口。
+
+图中黄色入口截面/短箭头表示 `CONFIRMED`；暗色为 `TENTATIVE`（待确认）或 `UNVERIFIED`（缺结构/完整边界证据），灰色为 `HELD`。`E编号` 用于观察同一入口是否持续关联。白圈只是路线建议，**不是控制目标**；青色箭头仍仅表示原巡航控制获准的目标。新增图底部说明区域，不改变地图比例。
+
+日志新增 `exits=`、`suggestion=`、`preferred=`，以及每个入口的编号、相对接近走廊的 LEFT/FORWARD/RIGHT、状态、车体位置、方向、宽度、纵深可见比例和年龄。顺时针路线默认优先推荐已确认、当前可见的右侧入口，其次前向、左侧；`LEFT_AVAILABLE` 只说明看到左侧入口，**不证明其他方向被堵或必须左转**。`HELD` 和未确认入口不参与建议。编号在重置后不复用；短时遮挡过长后可能取得新编号。
+
+局限：这是局部入口几何假设，不是完整拓扑地图或路口语义分类器。宽门/房间可能满足这些几何条件，仍须通过录制片段核对；斜向假设也不等于精确拟合出口航向。短 Z 形路段不要求回中，但仍需要可见的入口证据及有效接近坐标，不能保证墙角遮挡时提前看见第二弯。转弯行为选择、连续弯曲路径、最小转弯半径及整个车体扫掠检查留待下一阶段。因此在路口仍可能 `CORRIDOR_LOST` 停车，同时显示黄色出口，这是本阶段的预期行为。
+
+参数均为 `exit_` 前缀，完整默认值见 YAML，字段中文注释见 `ExitConfig`：
+
+| 参数（省略 exit_） | 含义 |
+|---|---|
+| `enabled`、`prefer_right` | 开关及顺时针路线的右侧建议优先级；关闭诊断不改变控制算法 |
+| `search_front_m`、`search_rear_m`、`sample_step_m` | 侧向入口搜索前/后范围和采样间隔，4.0/0.3/0.1 m |
+| `min_width_m`、`max_width_m` | 可见入口宽度范围，1.0–3.5 m，不代表车辆转弯所需空间 |
+| `probe_depth_m`、`min_depth_visible_ratio` | 纵深 1.0 m、至少 15% 入口宽度具有该纵深观测 |
+| `forward_gate_m`、`clearance_m` | 前向截面起点 1.3 m、可见性余量 0.08 m |
+| `direction_offset_deg` | 侧向正交方向之外尝试 ±20° |
+| `wall_band_m`、`min_wall_points`、`min_wall_span_m` | 真实边界支持带宽/点数/跨度，0.25 m / 5 / 0.45 m |
+| `confirm_frames`、`confirm_time_s` | 连续确认门槛，3 帧且至少 0.15 s |
+| `match_distance_m`、`match_angle_deg` | 世界坐标关联容差，0.8 m / 30° |
+| `hold_time_s`、`hold_travel_m` | 不可见入口编号保留，0.5 s / 0.5 m |
+| `context_timeout_s`、`context_travel_m` | 接近走廊参考保持，3.0 s / 2.0 m，仅诊断使用 |
+| `max_update_gap_s` | 超过 0.5 s 扫描间隔则重建跟踪 |
+
+### 有界离线分析
+
+正常 GUI 回放命令不变。另有不启动节点、不发布控制的分析工具，只读取 `.db3` 中指定时间段的独立 `/scan` 与 `/encoder_imu_node/odom` 小消息，跳过 AllSensor 图像载荷：
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+python3 ~/ros2_ws/src/process_node/tools/analyze_exits.py \
+  /data/data_whole/rosbag2_2026_10_06-18_13_20/rosbag2_2026_10_06-18_13_20_0.db3 \
+  --offset 0 --duration 30 --output /tmp/exit_analysis
+```
+
+输出 `frames.csv`、`summary.json` 和少量诊断 PNG。修改 offset 选择路口片段；每次最多 120 s / 20000 条小消息。重复分析建议换一个 output 目录，避免混入此前保存的 PNG。该工具使用 dataclass 默认配置，不读取现场 YAML；结果不能直接等同于 AllSensor 实时回放或实车通过率。输出放仓库外，不提交大型实验结果。
+
+2026-10-22 验证：原功能及新增几何/节点测试共 213 项通过；覆盖前方开放时右侧分支、双侧丁字路口、斜向拐角、窄门洞、无回波/未知区域、障碍遮挡、短 Z 形反向出口、位姿补偿、确认/失效，以及开关诊断后的控制输出一致性。当前课程 bag 的独立扫描局部分析：0–30 s 的 361 帧中，初始化后 356 帧建议前向，未产生已确认侧向出口；110–140 s 有 62 帧右侧建议；250–280 s 有 30 帧左侧、33 帧右侧建议（约 254.54 s / 260.37 s 分别开始确认）。这些是几何检测结果，并非人工标注的识别准确率。四段共读取约 22 MB 小消息载荷，没有完整读取 6 GB 图像数据。结果留在本机 `/tmp/exit_diagnosis`。
+
+另外开启实际 VS Code/X11 窗口，以 AllSensor 回放约 20 s：处理 182 帧，反馈全部有效，无 `UNALIGNED_ODOM`，窗口正常显示；观察到的最大接收至回调完成时间约 0.35 s。该测试验证实时接收与图形负载，不能替代转弯控制的实车验证。
 
 ## 控制器如何工作
 
@@ -194,7 +248,7 @@ ros2 launch process_node process_node.launch.py use_sim_time:=true show_visualiz
 - `odom=OK` 表示反馈可用；`WAITING_ODOM`/`INITIALIZING_ODOM` 表示等待输入或差分起点尚未就绪；`STALE_ODOM` 表示有效估计接收超时；`UNALIGNED_ODOM` 表示反馈与激光时间差过大；`INVALID_ODOM`、`DUPLICATE_ODOM`、`ODOM_TIME_REWIND`、`ODOM_TIME_GAP`、`ODOM_POSE_JUMP` 分别标记输入或差分连续性问题。默认门控开启时，不可用反馈会阻止行驶，定时器也会独立检测反馈超时。
 - 新日志 `v/raw_v` 为滤波/原始物理速度（m/s），`yaw/turn` 为当前/累计航向（度），`travel/signed` 为累计路程/有符号行程（m），`local` 为局部位置（m），`dt` 为差分间隔，`skew` 为关联反馈时间减激光时间（s）。反馈无效时仍可能显示缓存值，但它们仅供诊断，不能用于控制。
 - 闭环日志增加 `v_ref`（斜坡后目标）、`requested`（请求目标）、`v_used`（本次控制使用的关联速度）、`e_v`、动力 `[FF,P,I]`、转向 `[P,D]`、`control_dt`，以及幅值饱和 `sat`、变化率限制 `rate`、冻结积分 `I_frozen` 和撤去微分 `D_reset` 标记。激光图也显示目标/反馈速度及 P/I/D 项。
-- 巡航图新增棕色墙线模型、紫色中线/参考目标；青色仍是实际获准执行的目标，最后绘制避免被参考覆盖。紫色模型出现不代表控制已获准。`axis` 是走廊方向，`center_left` 正表示中线在左、负表示中线在右，`width` 是走廊宽度；日志还显示 `confidence`、观测年龄 `age`、双墙年龄 `pair_age` 和 `speed_scale`。图像增高到 900 像素以容纳诊断。
+- 巡航图新增棕色墙线模型、紫色中线/参考目标；青色仍是实际获准执行的目标，最后绘制避免被参考覆盖。紫色模型出现不代表控制已获准。`axis` 是走廊方向，`center_left` 正表示中线在左、负表示中线在右，`width` 是走廊宽度；日志还显示 `confidence`、观测年龄 `age`、双墙年龄 `pair_age` 和 `speed_scale`。传入出口诊断时图高为 1060 像素，增加底部入口信息；不传时仍为 900 像素。
 - `CORRIDOR_TRACKING` 表示采用双墙，`CORRIDOR_SINGLE_WALL`/`CORRIDOR_HOLD` 表示限时降速；这三个是参考状态，节点还需通过控制器才能 `OK`。`CORRIDOR_ACQUIRING`、`CORRIDOR_LOST`、`CORRIDOR_OUT_OF_RANGE`、`CORRIDOR_TIME_INVALID`、`CRUISE_BLOCKED` 均停止。参考置信分数不等于碰撞检查结果。
 - `CONTROL_WARMUP` 为有效输入恢复后的首帧等待；`CONTROL_TIME_INVALID`/`CONTROL_TIME_GAP` 为控制时间不连续；`STOP_REQUESTED` 包括零目标速度。这些状态均停止。录制数据中车辆速度不受本次输出影响，实测速度高于斜坡目标时动力输出为停止值是可能的，不能据此判断实车调速效果。
 - 按 q、Esc 或关闭任一窗口会发送停止值并退出节点，Ctrl+C 也可退出。输入超时还会周期性发送停止值；这些值的物理效果仍须在实车上确认。
@@ -269,7 +323,8 @@ python3 -m pytest src/process_node/test/test_perception.py \
   src/process_node/test/test_motion.py src/process_node/test/test_control.py \
   src/process_node/test/test_pid_controller.py src/process_node/test/test_node_closed_loop.py \
   src/process_node/test/test_node_baseline.py src/process_node/test/test_window_monitor.py \
-  src/process_node/test/test_input_buffer.py -q
+  src/process_node/test/test_input_buffer.py \
+  src/process_node/test/test_exits.py src/process_node/test/test_node_exits.py -q
 ```
 
 测试覆盖扫描点数和角度排列变化、数组首尾、无回波与其他非有限值的区别、短缺口/长未知段、过窄开口、inf 邻近孤立近点、量程与规划上限、整帧回波不足、左右镜像、安装偏角、运动反馈单位/符号、航向接缝、时间对齐、反馈失效停车、控制限幅、超时和窗口关闭。`test/data/corridor_start_scan.npz` 保留约 4.9 KB 的录制首帧雷达用于回归，无需安装完整 bag。录制数据回放只验证输入解释与决策计算，不代表已经完成实车闭环绕障。

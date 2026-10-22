@@ -61,6 +61,9 @@ tar -xzf /tmp/process_node_transfer.tar.gz
 └── process_node/
     ├── process_node.py
     ├── perception.py
+    ├── corridor.py
+    ├── exits.py
+    ├── input_buffer.py
     ├── motion.py
     ├── control.py
     ├── pid_controller.py
@@ -116,7 +119,10 @@ python3 -m pytest src/process_node/test/test_perception.py \
   src/process_node/test/test_motion.py src/process_node/test/test_control.py \
   src/process_node/test/test_pid_controller.py src/process_node/test/test_node_closed_loop.py \
   src/process_node/test/test_node_baseline.py \
-  src/process_node/test/test_window_monitor.py -q
+  src/process_node/test/test_window_monitor.py \
+  src/process_node/test/test_corridor.py src/process_node/test/test_node_corridor.py \
+  src/process_node/test/test_input_buffer.py \
+  src/process_node/test/test_exits.py src/process_node/test/test_node_exits.py -q
 ```
 
 测试需要 `pytest`；现有测试通过也不能证明实车绕障成功。
@@ -170,7 +176,7 @@ ros2 topic info /process_node/control --verbose
 
 时间阈值、滤波和跳变检查参数见 `config/baseline.yaml` 及 README；完整 bag 回放需保留独立里程计话题。
 
-当前版本标签为 `midterm-corridor-v3.1`，默认 `control_mode=closed_loop`、`reference_mode=corridor`，由走廊走向和横向偏移生成目标，再执行方向 PD 与速度 PI。正常物理请求速度 `target_speed_mps=0.2`，单墙、历史保持或较大偏差时默认减半。先连续 3 帧确认双墙，再由控制器预热一帧。停止、传感器/反馈失效或时间异常会清空相应控制历史，超时/异常也会清除走廊参考。corridor 仅支持 closed_loop 和有效独立反馈；仅离线观察激光时需同时设置 `reference_mode=perception`、`control_mode=baseline`、`require_motion_feedback=false`，仍不能连接实车驱动使用。
+当前版本标签为 `midterm-exits-v4`，默认 `control_mode=closed_loop`、`reference_mode=corridor`，由走廊走向和横向偏移生成目标，再执行方向 PD 与速度 PI；新增出口诊断不参与控制。正常物理请求速度 `target_speed_mps=0.2`，单墙、历史保持或较大偏差时默认减半。先连续 3 帧确认双墙，再由控制器预热一帧。停止、传感器/反馈失效或时间异常会清空相应控制历史，超时/异常也会清除走廊参考和出口缓存。corridor 仅支持 closed_loop 和有效独立反馈；仅离线观察激光时需同时设置 `reference_mode=perception`、`control_mode=baseline`、`require_motion_feedback=false`，仍不能连接实车驱动使用。
 
 首次中位/速度 PI 测试可用 `reference_mode=straight` 和较低的 `target_speed_mps`。straight 只接受合格的 0°候选，不锁定全局航向。完成基础标定后，以 `reference_mode=corridor` 在直走廊低速检查回正与回中；`reference_mode=perception` 保留上一版局部评分供离线对照。可用 `ros2 run` 的 ROS 参数覆盖，具体命令见 README。launch 的启动参数仍是 config、use_sim_time、show_visualization，其他参数通过 YAML 配置。
 
@@ -180,6 +186,8 @@ ros2 topic info /process_node/control --verbose
 - `+inf` 继续按受限无回波参与规划，`no_return_distance_m` 默认 5 m，实际受 `LaserScan.range_max` 限制；设 0 可禁用。先核对目标雷达驱动的 `+inf` 语义及有效探测范围，不把蓝色规划标记当成真实回波。`min_scan_finite_ratio` 默认 0.05，全无有限回波仍停止。`min_bin_valid_ratio`/`min_window_valid_ratio` 指有限回波与受限无回波的合计可用比例。
 - 新增 `corridor.py` 及整套 `corridor_*` 参数，必须连同新 YAML 迁移。`corridor_sensor_x_m/y_m` 是雷达相对 odom 子坐标系原点的安装平移，默认 0；雷达偏航仍由原 `sensor_yaw_offset_deg` 设置。核验走廊方向 `axis`、中线在左为正的 `center_left`、观测宽度 `width`，确保安装偏移不会被误当成车辆偏离中线。
 - 墙线拟合范围、网格、支持点数/跨度/误差、平行与宽度约束、历史跳变门槛及失效期限，见 README 的走廊参数表。墙线只使用真实回波；离群点只在拟合中排除，仍参与碰撞检查。单墙依赖近期双墙宽度，最多 0.6 s；双墙均缺失时默认最多保持 0.3 s，过期后重新确认。
+- 新增 `exits.py`、`exit_*` 参数和 `tools/analyze_exits.py`，随整个包迁移，不增加第三方依赖或 launch 参数。出口使用同一组 `corridor_sensor_x_m/y_m` 安装平移。默认至少 1.0 m 可见入口、1.0 m 纵深、15% 纵深可见比例，真实边界证据及连续 3 帧 / 0.15 s 才确认；几何阈值需按现场观测核对。接近走廊坐标最多保持 3 s / 2 m，入口丢失最多保留编号 0.5 s / 0.5 m，这些是诊断期限，不放宽原控制保护。
+- 黄色入口、`E编号`、白圈和 `suggestion` 仅供诊断，青色仍是获准控制目标；路口出现已确认出口但 `CORRIDOR_LOST` 停车是本阶段预期行为。顺时针路线默认建议右侧，其次前向/左侧；未确认及 HELD 不参与建议。宽房门/房间可能满足几何条件，不能仅凭建议自动转向。短 Z 形不要求回中或全局冷却，但入口仍须可见；路径衔接及弯曲车体检查尚未实现。图例、全参数、有限时段离线分析命令见 README“道路出口识别与追踪”。
 - 里程计坐标系和消息时间；低速前进的 `v` 应为正、倒退为负，静止应接近零，航向及位置尺度需核验。
 - 转向中位、正负方向、幅度、增益，以及动力值和停止值；`steer` 和 `speed` 均是底层控制量，不直接等于转角和 m/s。
 - `steer_sign`、`speed_sign`、前进动力死区和前馈系数/偏置，随后标定 PD/PI 增益；`speed_effort_limit`、变化率限制和物理目标速度上限需适配具体车辆。默认增益没有实车验证。
@@ -222,3 +230,5 @@ ros2 topic info /process_node/control --verbose
 走廊参考版本已构建并通过 **174 项测试**，同一 30 秒得到 356 帧双墙参考、1 帧单墙、2 帧初始确认；最终 326 帧正常控制、3 帧控制预热、2 帧走廊确认、28 帧原近点包络停止。10–30 秒均正常计算，并产生有符号的回中修正。已在隔离 ROS 域用安装后的 launch/YAML 与真实 bag play 检查运行、反馈未对齐时停止并重新确认、播放停止后的超时停车和正常退出。新增 `corridor.py` 随包自动安装，RANSAC/最小二乘只用已有 NumPy，无新增第三方运行依赖；现场仍需标定安装偏移、目标点距离、横向增益、降速门槛和 PD/PI。
 
 v3.1 调度修复通过 **181 项测试**。在用户相同的 VS Code/X11 图形环境中开启真实窗口回放约 30 s，316 帧反馈全部有效、无未对齐，关联差约 ±13 ms；10–30 秒处理的 211 帧均正常控制。主动替换 35 个中间扫描以处理最新观测，播放停止后超时停车并正常退出。此前只关闭 GUI 做实时验证未覆盖图形转发负载，本次补充了该条件；以上仍非实车结果。
+
+2026-10-22 出口诊断 v4 已构建，通过 **213 项功能测试**。覆盖前方开放时右侧分支、双侧丁字路口、斜向拐角、窄门洞/未知/无回波、障碍、短 Z 形反向出口、odom 关联与期限，及开关诊断时控制结果一致性。课程独立 /scan 的局部片段观察到右侧及先左后右出口的连续确认，四段仅读取约 22 MB 小消息载荷；详细统计和局限见 README。开启真实图形窗口 AllSensor 回放约 20 s，182 帧反馈均有效，窗口正常，无未对齐；未在助教设备或实车验证，也未实现自动转弯。
