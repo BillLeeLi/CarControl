@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -67,11 +68,11 @@ def test_a_few_far_points_in_unknown_area_do_not_form_a_passage():
 def test_short_bounded_hole_is_marked_inferred_but_long_hole_stays_unknown():
     scan = make_scan()
     angles = wrap_angle(np.arange(1440) * scan.angle_increment)
-    scan.ranges[np.abs(angles) < math.radians(0.9)] = np.inf
+    scan.ranges[np.abs(angles) < math.radians(0.9)] = np.nan
     short = analyze_scan(scan, PlannerConfig())
     assert short.scan.inferred.any()
     assert short.target.angle == pytest.approx(0)
-    scan.ranges[np.abs(angles) < math.radians(15)] = np.inf
+    scan.ranges[np.abs(angles) < math.radians(15)] = np.nan
     long = analyze_scan(scan, PlannerConfig())
     center = np.abs(long.scan.bin_angles) < math.radians(10)
     assert np.isnan(long.scan.bin_ranges[center]).all()
@@ -141,3 +142,139 @@ def test_empty_scan_bad_metadata_and_bad_configuration():
     assert analyze_scan(scan, PlannerConfig()).status == 'INVALID_METADATA'
     with pytest.raises(ValueError):
         replace(PlannerConfig(), vehicle_width_m=-1)
+
+
+def corridor_scan(count=1440, angle_min=0.0, reverse=False):
+    """两侧墙相距 2.2 m、前方很长无回波的直走廊。"""
+    scan = make_scan(count=count, angle_min=angle_min, reverse=reverse)
+    angles = wrap_angle(angle_min + np.arange(count) * scan.angle_increment)
+    side = np.abs(np.sin(angles))
+    scan.ranges = np.divide(1.1, side, out=np.full(count, np.inf), where=side > 1e-6)
+    scan.ranges[scan.ranges > 4.0] = np.inf
+    return scan
+
+
+@pytest.mark.parametrize('count,angle_min,reverse', [
+    (360, 0.0, False), (1658, 0.0, False), (1673, -math.pi, True),
+])
+def test_corridor_no_return_center_is_a_straight_candidate(count, angle_min, reverse):
+    scan = corridor_scan(count, angle_min, reverse)
+    original = scan.ranges.copy()
+    result = analyze_scan(scan, PlannerConfig())
+    assert result.status == 'OK'
+    assert result.target.angle == pytest.approx(0)
+    assert result.target.valid_ratio == 0  # 窗口内没有有限回波，也允许合法候选。
+    assert result.target.support_ratio == 1
+    assert result.target.no_return_ratio == 1
+    assert result.target.clearance_m <= 5.0 - PlannerConfig().radius_m
+    np.testing.assert_array_equal(scan.ranges, original)
+    if angle_min == 0:
+        assert np.isposinf(result.scan.ranges[0])
+
+
+def test_no_return_is_not_interpolation_or_a_finite_measurement():
+    scan = corridor_scan()
+    result = analyze_scan(scan, PlannerConfig())
+    center = np.abs(result.scan.bin_angles) < math.radians(10)
+    assert (result.scan.bin_ranges[center] == 5.0).all()
+    assert not result.scan.inferred[center].any()
+    assert not result.scan.valid[result.scan.positive_inf].any()
+
+
+def test_long_nan_region_remains_unknown_even_next_to_no_return():
+    scan = corridor_scan()
+    angles = wrap_angle(np.arange(len(scan.ranges)) * scan.angle_increment)
+    scan.ranges[np.abs(angles) < math.radians(20)] = np.nan
+    result = analyze_scan(scan, PlannerConfig())
+    assert not any(abs(c.angle) < math.radians(10) for c in result.candidates)
+    center = np.abs(result.scan.bin_angles) < math.radians(15)
+    assert np.isnan(result.scan.bin_ranges[center]).all()
+
+
+def test_no_return_endpoints_do_not_interpolate_nan_holes():
+    scan = corridor_scan()
+    angles = wrap_angle(np.arange(len(scan.ranges)) * scan.angle_increment)
+    scan.ranges[np.abs(angles) < math.radians(0.9)] = np.nan
+    result = analyze_scan(scan, PlannerConfig())
+    assert not any(abs(c.angle) < 1e-9 for c in result.candidates)
+    assert not result.scan.inferred.any()
+
+
+@pytest.mark.parametrize('obstacle', [0.7, 0.01, -np.inf])
+def test_near_obstacle_inside_no_return_center_blocks_straight(obstacle):
+    scan = corridor_scan()
+    scan.ranges[0] = obstacle
+    result = analyze_scan(scan, PlannerConfig())
+    assert not any(abs(c.angle) < 1e-9 for c in result.candidates)
+    if result.target is not None:
+        assert abs(result.target.angle) > math.radians(10)
+
+
+def test_a_single_finite_near_point_in_no_return_bin_is_not_lost():
+    scan = corridor_scan(count=3600)
+    scan.ranges[0] = 0.7  # 同箱大多数为 inf，仍必须保留这个真实近点。
+    data = prepare_scan(scan, PlannerConfig())
+    assert np.nanmin(data.bin_ranges) == pytest.approx(0.7)
+    result = analyze_scan(scan, PlannerConfig())
+    assert not any(abs(c.angle) < 1e-9 for c in result.candidates)
+
+
+def test_no_return_distance_is_limited_by_sensor_range_and_can_be_disabled():
+    scan = corridor_scan()
+    scan.range_max = 1.8
+    cfg = PlannerConfig(min_scan_finite_ratio=0.01)
+    data = prepare_scan(scan, cfg)
+    assert data.no_return_limit_m == 1.8
+    assert analyze_scan(scan, cfg).target is None  # 末端圆盘超出了本帧可规划范围。
+    scan = corridor_scan()
+    disabled = analyze_scan(scan, PlannerConfig(no_return_distance_m=0))
+    assert not any(abs(c.angle) < 1e-9 for c in disabled.candidates)
+
+
+def test_no_return_planning_distance_must_cover_the_whole_end_disk():
+    cfg = PlannerConfig(no_return_distance_m=1.6)
+    result = analyze_scan(corridor_scan(), cfg)
+    assert result.target is None
+    assert result.status == 'NO_CLEAR_PATH'
+
+
+def test_candidate_generation_does_not_require_a_far_background_gap():
+    # 周围真实点距雷达 1.9 m，少于粗筛的 1.947 m；但圆盘沿直线仍可前移 1.5 m。
+    # 去掉窗口中央的近角度点，得到可通过、而粗开口不足以容纳圆盘的场景。
+    scan = make_scan()
+    angles = wrap_angle(np.arange(len(scan.ranges)) * scan.angle_increment)
+    scan.ranges[:] = 1.9
+    scan.ranges[np.abs(angles) < math.radians(10)] = np.inf
+    result = analyze_scan(scan, PlannerConfig())
+    assert not result.gaps
+    assert result.target is not None
+    assert result.target.angle == pytest.approx(0)
+
+
+def test_missing_scan_sector_is_not_treated_as_no_return():
+    scan = make_scan(count=720, angle_min=math.radians(20))
+    scan.ranges = scan.ranges[:640]  # 正前方缺少扫描，不能当作 +inf 射线。
+    result = analyze_scan(scan, PlannerConfig())
+    assert not any(abs(c.angle) < 1e-9 for c in result.candidates)
+
+
+@pytest.mark.parametrize('kwargs', [
+    {'no_return_distance_m': -1.0}, {'no_return_distance_m': 6.0},
+    {'min_scan_finite_ratio': -0.1}, {'min_scan_finite_ratio': 1.1},
+])
+def test_no_return_configuration_is_validated(kwargs):
+    with pytest.raises(ValueError):
+        PlannerConfig(**kwargs)
+
+
+def test_recorded_corridor_start_has_a_forward_candidate():
+    with np.load(Path(__file__).parent / 'data' / 'corridor_start_scan.npz') as saved:
+        scan = SimpleNamespace(ranges=saved['ranges'], **{
+            name: float(saved[name]) for name in
+            ('angle_min', 'angle_increment', 'range_min', 'range_max')
+        })
+    result = analyze_scan(scan, PlannerConfig())
+    assert result.status == 'OK'
+    assert any(abs(c.angle) < 1e-9 for c in result.candidates)
+    assert abs(result.target.angle) < math.radians(6)
+    assert result.target.clearance_m >= PlannerConfig().lookahead_m

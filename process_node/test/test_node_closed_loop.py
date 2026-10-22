@@ -13,6 +13,7 @@ from process_node.pid_controller import PIDController
 from process_node.process_node import LaserWindowAnalyzer
 from test_motion import odom
 from test_node_baseline import message
+from test_perception import corridor_scan
 
 
 @pytest.fixture
@@ -105,3 +106,33 @@ def test_duplicate_scan_does_not_integrate_again(node):
     node.laser_scan_callback(scan_at(100.1))
     assert node.status == 'CONTROL_TIME_INVALID'
     assert node.speed_value == node.stop_speed
+
+
+def test_no_return_corridor_runs_and_invalid_center_stops_then_warms_up(node):
+    def corridor_at(t):
+        msg = scan_at(t)
+        scan = corridor_scan(count=720)
+        msg.urg.angle_increment = scan.angle_increment
+        msg.urg.ranges = scan.ranges.astype(np.float32).tolist()
+        return msg
+
+    node.odometry_callback(odom(99.9))
+    node.odometry_callback(odom(100.0))
+    node.laser_scan_callback(corridor_at(100.0))
+    assert node.status == 'CONTROL_WARMUP'
+    node.odometry_callback(odom(100.1))
+    node.laser_scan_callback(corridor_at(100.1))
+    assert node.status == 'OK'
+    assert node.last_plan.target.angle == pytest.approx(0)
+    assert node.last_plan.target.valid_ratio == 0
+    assert node.speed_value != node.stop_speed
+
+    msg = corridor_at(100.2)
+    msg.urg.ranges = [float('nan')] * 720
+    node.odometry_callback(odom(100.2))
+    node.laser_scan_callback(msg)
+    assert node.status == 'NO_VALID_RANGES'
+    assert node.speed_value == node.stop_speed
+    node.odometry_callback(odom(100.3))
+    node.laser_scan_callback(corridor_at(100.3))
+    assert node.status == 'CONTROL_WARMUP'

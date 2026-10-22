@@ -45,7 +45,7 @@ class LaserWindowAnalyzer(Node):
             }
         )
         self.declare_parameter("sensorTopic", "/sync_store_node/allsensor")
-        self.declare_parameter("group_label", "midterm-pd-pi-v1")
+        self.declare_parameter("group_label", "midterm-inf-v2")
         self.declare_parameter("show_visualization", True)
         self.declare_parameter("control_mode", "closed_loop")
         self.declare_parameter("reference_mode", "perception")
@@ -270,7 +270,9 @@ class LaserWindowAnalyzer(Node):
         target = result.target
         direction = "--" if target is None else f"{math.degrees(target.angle):+.2f}deg"
         clearance = "--" if target is None else f"{target.clearance_m:.2f}m"
-        support = "--" if target is None else f"{target.valid_ratio:.0%}"
+        support = "--" if target is None else f"{target.support_ratio:.0%}"
+        finite = "--" if target is None else f"{target.valid_ratio:.0%}"
+        no_return = "--" if target is None else f"{target.no_return_ratio:.0%}"
         mean = "--" if target is None else f"{target.mean_distance_m:.2f}m"
         front = (
             "unknown"
@@ -281,7 +283,9 @@ class LaserWindowAnalyzer(Node):
             f"[{self.label}] {self.status} | valid={data.valid_ratio:.1%}"
             f" ({int(data.valid.sum())}/{data.ranges.size}) +inf={int(data.positive_inf.sum())}"
             f" invalid={int((~data.valid & ~data.positive_inf).sum())}"
-            f" | target={direction} support={support} finite_mean={mean}"
+            f" | target={direction} support={support} finite={finite}"
+            f" no_return={no_return} planning_mean={mean}"
+            f" no_return_limit={data.no_return_limit_m:.2f}m"
             f" clearance={clearance} front={front}"
             f" gaps={len(result.gaps)} candidates={len(result.candidates)}"
             f" | steer={self.steer_value} speed={self.speed_value} | {motion_text}"

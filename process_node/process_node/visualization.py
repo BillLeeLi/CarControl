@@ -55,7 +55,7 @@ def draw_laser(result, config, status, steer, speed, label, command=None):
               f'  total={data.ranges.size}', 72)
         front = '-- (unknown)' if result.front_clearance_m is None \
             else f'{result.front_clearance_m:.2f}m'
-        _text(image, f'front sweep clearance={front} | gaps={len(result.gaps)}'
+        _text(image, f'front planning clearance={front} | gaps={len(result.gaps)}'
               f' candidates={len(result.candidates)}', 96)
 
         for gap in result.gaps:
@@ -63,9 +63,12 @@ def draw_laser(result, config, status, steer, speed, label, command=None):
             arc = np.array([ray(a, config.lookahead_m + config.radius_m)
                             for a in angles], dtype=np.int32)
             cv2.polylines(image, [arc], False, (40, 130, 40), 3)
-        # 红色标记位于外圈，仅标明“该角度未知”，绝不表示那里测到墙。
-        for angle in data.angles[~data.valid]:
+        # 无效/未采用的射线为红色；+inf 用蓝色显示其规划上限，不画成真实白色障碍。
+        no_return = data.positive_inf & data.supported
+        for angle in data.angles[~data.valid & ~no_return]:
             cv2.circle(image, ray(angle, config.max_distance_m), 2, (70, 70, 210), -1)
+        for angle in data.angles[no_return]:
+            cv2.circle(image, ray(angle, data.no_return_limit_m), 2, (230, 130, 60), -1)
         for angle, distance in zip(data.angles[data.valid], data.ranges[data.valid]):
             cv2.circle(image, ray(angle, min(distance, config.max_distance_m)),
                        2, (225, 225, 225), -1)
@@ -88,9 +91,10 @@ def draw_laser(result, config, status, steer, speed, label, command=None):
             cv2.arrowedLine(image, pixel(0, 0), end, (255, 235, 0), 3)
             _text(image, f'target={math.degrees(target.angle):+.1f}deg'
                   f' clearance={target.clearance_m:.2f}m'
-                  f' support={target.valid_ratio:.0%}', 120, (255, 235, 0))
-            _text(image, f'finite mean (capped)={target.mean_distance_m:.2f}m'
-                  f' inferred={target.inferred_ratio:.0%} score={target.score:.3f}', 144)
+                  f' support={target.support_ratio:.0%}', 120, (255, 235, 0))
+            _text(image, f'finite={target.valid_ratio:.0%} no-return={target.no_return_ratio:.0%}'
+                  f' mean(plan)={target.mean_distance_m:.2f}m'
+                  f' inferred={target.inferred_ratio:.0%}', 144)
         elif status != 'OK':
             _text(image, 'No active target; STOP output (see status / terminal)', 120, (70, 70, 240))
 
@@ -109,7 +113,7 @@ def draw_laser(result, config, status, steer, speed, label, command=None):
         pixel(-config.rear_overhang_m, config.vehicle_width_m / 2),
     ], dtype=np.int32)
     cv2.polylines(image, [rectangle], True, (0, 220, 0), 2)
-    _text(image, 'white: measured (clipped) | red outer ring: unknown direction', 746)
+    _text(image, 'white: measured | blue: bounded no-return | red: invalid / unknown', 746)
     _text(image, 'orange: inferred short hole | green: gap / straight swept footprint', 768)
     _text(image, 'cyan: selected target | q / Esc / close window: stop and exit', 790)
     return image

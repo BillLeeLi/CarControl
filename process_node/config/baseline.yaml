@@ -2,7 +2,7 @@
 /**:
   ros__parameters:
     sensorTopic: /sync_store_node/allsensor
-    group_label: midterm-pd-pi-v1
+    group_label: midterm-inf-v2
     show_visualization: true
     control_mode: closed_loop  # closed_loop: PD/PI；baseline: 旧比例转向和固定动力
     reference_mode: perception  # perception: 跟踪感知方向；straight: 仅接受合格的 0° 候选
@@ -27,10 +27,14 @@
     safety_margin_m: 0.10
     lookahead_m: 1.50
     max_distance_m: 5.0
+    # +inf 按“此有限规划范围内未命中”参与候选；原始 ranges 仍保留 inf。
+    # 实际上限还受 LaserScan.range_max 限制，0 可禁用；不是实测自由距离。
+    no_return_distance_m: 5.0
+    min_scan_finite_ratio: 0.05  # 整帧至少 5% 为真实有限回波；全 inf 仍停止
     front_half_angle_deg: 75.0
     bin_angle_deg: 1.0
-    min_bin_valid_ratio: 0.5
-    min_window_valid_ratio: 0.6
+    min_bin_valid_ratio: 0.5  # 有限回波 + 受限无回波的可用比例
+    min_window_valid_ratio: 0.6  # 不再要求窗口内必须有有限回波
     max_interpolate_gap_deg: 2.0
     interpolate_range_jump_m: 0.5
     max_inferred_ratio: 0.2
