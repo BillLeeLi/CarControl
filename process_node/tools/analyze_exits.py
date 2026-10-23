@@ -19,6 +19,7 @@ from process_node.exits import ExitConfig, ExitTracker
 from process_node.motion import MotionConfig, MotionEstimator
 from process_node.perception import PlannerConfig, analyze_prepared_scan, prepare_scan
 from process_node.visualization import draw_laser
+from process_node.turning import RightTurnBehavior
 
 
 def main():
@@ -28,6 +29,7 @@ def main():
     parser.add_argument('--duration', type=float, default=30., help='分析时长，最多 120 秒')
     parser.add_argument('--scan-stride', type=int, default=1, help='每 N 帧扫描处理一帧，里程计不跳过')
     parser.add_argument('--output', type=Path, required=True, help='仓库外的结果目录')
+    parser.add_argument('--turns', action='store_true', help='同时运行右转几何行为；不运行 PID、不发布控制')
     args = parser.parse_args()
     if not 0 < args.duration <= 120 or args.offset < 0 or args.scan_stride < 1:
         parser.error('duration 应在 (0, 120] 秒内，offset 应非负，scan-stride 应为正整数')
@@ -51,6 +53,8 @@ def main():
         corridor = CorridorTracker(CorridorConfig())
         tracker = ExitTracker(ExitConfig())
         motion = MotionEstimator(MotionConfig())
+        turning = RightTurnBehavior(planner=planner)
+        turn_states = Counter()
         states, recommendations = Counter(), Counter()
         count, payload, last_picture = 0, 0, -1e9
         previous_signature = None
@@ -60,7 +64,8 @@ def main():
         with (args.output/'frames.csv').open('w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['bag_s', 'odom', 'corridor', 'exits', 'suggestion', 'preferred_id', 'tracks',
-                             'scan_dt_s', 'fitted_walls', 'corridor_reason', 'yaw_deg'])
+                             'scan_dt_s', 'fitted_walls', 'corridor_reason', 'yaw_deg',
+                             'behavior', 'turn_status', 'locked_exit', 'curvature', 'turn_reason'])
             for timestamp, topic, blob in rows:
                 payload += len(blob)
                 received = (timestamp-start)*1e-9
@@ -70,6 +75,7 @@ def main():
                     if motion.generation != generation:
                         corridor.reset()
                         tracker.reset()
+                        turning.invalidate('独立里程计重建')
                     continue
                 seen_scans += 1
                 if (seen_scans-1) % args.scan_stride:
@@ -81,6 +87,12 @@ def main():
                 data = prepare_scan(scan, planner)
                 estimate = corridor.update(data, feedback, stamp)
                 result = tracker.update(data, feedback, stamp, estimate)
+                turn = turning.update(data, feedback, stamp, estimate, result,
+                                      estimate.target_angle_rad if estimate.usable else None) if args.turns else None
+                if turn is not None:
+                    turn_states[turn.phase+':'+turn.status] += 1
+                    if turn.reset_corridor:
+                        corridor.reset()
                 costs.append((time.perf_counter()-before)*1000)
                 descriptions = [dict(id=t.track_id, side=t.side, state=t.state,
                                      kind=t.observation.role,
@@ -95,23 +107,28 @@ def main():
                                  json.dumps(descriptions),
                                  '' if previous_stamp is None else (stamp-previous_stamp)*1e-9,
                                  len(estimate.observed_walls), estimate.reason,
-                                 '' if feedback.state is None else np.degrees(feedback.state.yaw_rad)])
+                                 '' if feedback.state is None else np.degrees(feedback.state.yaw_rad),
+                                 '' if turn is None else turn.phase, '' if turn is None else turn.status,
+                                 '' if turn is None else turn.exit_id,
+                                 '' if turn is None else turn.curvature_per_m,
+                                 '' if turn is None else turn.reason])
                 previous_stamp = stamp
                 count += 1
                 states[result.status] += 1
                 recommendations[result.recommendation] += 1
-                signature = tuple((t.side, t.state) for t in result.tracks)
+                signature = (None if turn is None else (turn.phase, turn.status),
+                             tuple((t.side, t.state) for t in result.tracks))
                 if received-last_picture >= 5 or (signature != previous_signature
                                                   and received-last_picture >= 1):
                     # 不显示成控制获准：该工具根本没有运行控制器。
                     plan = analyze_prepared_scan(data, planner)
                     picture = draw_laser(plan, planner, 'DIAGNOSTIC_ONLY', 0, 0,
-                                         'exit replay', corridor=estimate, exits=result)
+                                         'exit replay', corridor=estimate, exits=result, turn=turn)
                     cv2.imwrite(str(args.output/f'exits_{received:.2f}s.png'), picture)
                     last_picture = received
                 previous_signature = signature
         summary = dict(scans=count, scan_messages=seen_scans, payload_bytes=payload, status=dict(states),
-                       suggestions=dict(recommendations),
+                       suggestions=dict(recommendations), turns=dict(turn_states),
                        perception_ms_median=float(np.median(costs)) if costs else None,
                        perception_ms_p95=float(np.percentile(costs, 95)) if costs else None,
                        note='独立 /scan，默认配置，未运行控制器；不能等同 AllSensor 实时控制或实车结果')

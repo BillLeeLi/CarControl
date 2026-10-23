@@ -12,7 +12,7 @@ from process_node.perception import wrap_angle
 class ExitConfig:
     """ROS 参数使用 exit_ 前缀；宽度/深度不是实际转弯可行性保证。"""
 
-    enabled: bool = True  # 是否运行出口诊断；关闭不改变巡航控制
+    enabled: bool = True  # 是否运行出口识别；关闭后不再提供新的右转触发证据
     search_front_m: float = 4.0  # 沿接近走廊向前搜索侧向入口的距离（米）
     search_rear_m: float = 0.3  # 允许入口中心略在车后，保持经过入口时的关联（米）
     sample_step_m: float = 0.10  # 入口横向与纵深采样间隔（米）
@@ -87,7 +87,7 @@ class ExitObservation:
 
 @dataclass(frozen=True)
 class TrackedExit:
-    """返回给绘图和日志的不可变跟踪快照。"""
+    """返回给行为、绘图和日志的不可变跟踪快照。"""
 
     track_id: int  # 同一个 odom 入口持续使用的编号，重置后也不复用旧编号
     observation: ExitObservation  # 经过运动补偿的当前车体坐标入口

@@ -2,7 +2,7 @@
 /**:
   ros__parameters:
     sensorTopic: /sync_store_node/allsensor
-    group_label: midterm-exits-v4.1
+    group_label: midterm-right-turn-v5
     show_visualization: true
     input_odom_queue_size: 200  # 独立接收线程的有界缓存；主线程先批量更新里程计
     visualization_period_s: 0.1  # 最多 10 Hz 刷新图像，窗口/按键事件仍持续处理
@@ -79,7 +79,7 @@
     corridor_recovery_heading_deg: 15.0
     corridor_recovery_offset_m: 0.25
     corridor_slow_speed_scale: 0.5
-    # 道路出口识别只画图/记录，不接管控制；右转建议对应顺时针路线。
+    # 道路出口提供几何证据；右转行为另行门控，不能只靠 preferred_id 下发转向。
     exit_enabled: true
     exit_search_front_m: 4.0
     exit_search_rear_m: 0.3
@@ -104,7 +104,7 @@
     exit_context_travel_m: 2.0
     exit_max_update_gap_s: 0.5
     exit_prefer_right: true
-    # 墙端旁斜前方开口只标为 SUSPECTED，不参与路线建议或控制。
+    # 墙端旁斜前方开口只标为 SUSPECTED，可低速接近，不能直接触发大转向。
     exit_corner_enabled: true
     exit_corner_min_angle_deg: 20.0
     exit_corner_max_angle_deg: 85.0
@@ -114,6 +114,33 @@
     exit_corner_wall_span_m: 0.35
     exit_corner_match_distance_m: 1.2
     exit_corner_match_angle_deg: 60.0
+    # 单个右转：CRUISE -> APPROACH -> TURN -> EXIT_ALIGN -> CRUISE。
+    # 以下为离线初值；min_radius、PD 响应与停车减速度必须实车核验。
+    turn_enabled: true  # false 恢复仅巡航；perception/straight 模式自动不接管
+    turn_approach_speed_mps: 0.10
+    turn_speed_mps: 0.10
+    turn_activate_distance_m: 3.5
+    turn_min_radius_m: 0.70
+    turn_max_radius_m: 1.20
+    turn_radius_samples: 4
+    turn_lookahead_m: 0.65
+    turn_check_distance_m: 0.80
+    turn_sample_step_m: 0.04
+    turn_reaction_time_s: 0.30
+    turn_braking_decel_mps2: 0.30
+    turn_exit_extension_m: 1.50
+    turn_max_tracking_error_m: 0.55
+    turn_min_angle_deg: 55.0
+    turn_max_angle_deg: 125.0
+    turn_hint_timeout_s: 0.50
+    turn_hint_context_s: 1.0
+    turn_max_update_gap_s: 0.50
+    turn_max_duration_s: 60.0  # 含最远 3.5 m 接近及低速出口对齐，不是固定转弯时长
+    turn_max_travel_m: 7.0
+    turn_exit_heading_tolerance_deg: 15.0
+    turn_exit_center_tolerance_m: 0.30
+    turn_exit_confirm_frames: 3
+    turn_passed_exit_distance_m: 1.0
     steer_center: 0
     steer_limit: 600
     # 以下两项仅在 control_mode=baseline 时使用。

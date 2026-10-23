@@ -29,6 +29,7 @@ from process_node.pid_controller import PIDConfig, PIDController
 from process_node.perception import PlannerConfig, analyze_scan, analyze_prepared_scan, prepare_scan
 from process_node.visualization import draw_laser, draw_steering
 from process_node.window_monitor import create_window_monitor
+from process_node.turning import RightTurnBehavior, TurnConfig
 
 
 class LaserWindowAnalyzer(Node):
@@ -49,7 +50,7 @@ class LaserWindowAnalyzer(Node):
             }
         )
         self.declare_parameter("sensorTopic", "/sync_store_node/allsensor")
-        self.declare_parameter("group_label", "midterm-exits-v4.1")
+        self.declare_parameter("group_label", "midterm-right-turn-v5")
         self.declare_parameter("show_visualization", True)
         self.declare_parameter("control_mode", "closed_loop")
         self.declare_parameter("reference_mode", "corridor")
@@ -108,6 +109,17 @@ class LaserWindowAnalyzer(Node):
         }), sensor_offset=(self.corridor.config.sensor_x_m, self.corridor.config.sensor_y_m),
             min_finite_ratio=self.config.min_scan_finite_ratio)
         self.last_exits = None
+        turn_defaults = TurnConfig()
+        for item in fields(turn_defaults):
+            self.declare_parameter('turn_' + item.name, getattr(turn_defaults, item.name))
+        turn_config = TurnConfig(**{
+            item.name: self.get_parameter('turn_' + item.name).value for item in fields(turn_defaults)
+        })
+        if max(turn_config.speed_mps, turn_config.approach_speed_mps) > pid_config.max_target_speed_mps:
+            raise ValueError('turn 速度不能超过 max_target_speed_mps')
+        self.turning = RightTurnBehavior(turn_config, self.config,
+                                         sensor_offset=self.exits.sensor_offset)
+        self.last_turn = None
         self.declare_parameter("sensor_timeout_s", 1.0)
         self.declare_parameter("log_period_s", 1.0)
         self.steer_center = self.get_parameter("steer_center").value
@@ -287,11 +299,13 @@ class LaserWindowAnalyzer(Node):
                 command=self.last_command,
                 corridor=self.last_corridor,
                 exits=self.last_exits,
+                turn=self.last_turn,
             )
 
     def _log_decision(self):
         now = time.monotonic()
-        log_status = (self.status, self.last_feedback.status)
+        log_status = (self.status, self.last_feedback.status,
+                      None if self.last_turn is None else (self.last_turn.phase, self.last_turn.status))
         if (
             log_status == self.last_log_status
             and now - self.last_log_time < self.log_period
@@ -331,6 +345,11 @@ class LaserWindowAnalyzer(Node):
                 f"{diagnostics.speed_rate_limited}) I_frozen={diagnostics.integral_frozen}"
                 f" D_reset={diagnostics.derivative_reset}"
             )
+        if self.last_turn is not None:
+            turn = self.last_turn
+            control_text += (f' | behavior={turn.phase} turn_status={turn.status}'
+                             f' locked_exit={turn.exit_id} curvature={turn.curvature_per_m:+.3f}/m'
+                             f' ({turn.reason})')
         result = self.last_plan
         if self.last_corridor is not None:
             estimate = self.last_corridor
@@ -366,7 +385,9 @@ class LaserWindowAnalyzer(Node):
             return
         data = result.scan
         target = result.target
-        direction = "--" if target is None else f"{math.degrees(target.angle):+.2f}deg"
+        active_angle = target.angle if target is not None else (
+            self.last_turn.heading_rad if self.last_turn is not None and self.last_turn.active else None)
+        direction = "--" if active_angle is None else f"{math.degrees(active_angle):+.2f}deg"
         clearance = "--" if target is None else f"{target.clearance_m:.2f}m"
         support = "--" if target is None else f"{target.support_ratio:.0%}"
         finite = "--" if target is None else f"{target.valid_ratio:.0%}"
@@ -452,6 +473,7 @@ class LaserWindowAnalyzer(Node):
                         self.speed_value, self.label, command=self.last_command,
                         corridor=self.last_corridor,
                         exits=self.last_exits,
+                        turn=self.last_turn,
                     )
                 cv2.imshow(self.LASER_WINDOW, laser)
                 self.last_gui_signature, self.last_gui_time = signature, now
@@ -477,6 +499,8 @@ class LaserWindowAnalyzer(Node):
         self.last_corridor = None
         self.exits.reset()
         self.last_exits = None
+        self.turning.invalidate('输入/反馈或扫描元数据失效，转弯已停止；重启后重新确认')
+        self.last_turn = None
 
     def _corridor_plan(self, urg, stamp_ns):
         """先生成运动补偿后的巡航参考，再由原感知检查实际可执行候选。"""
@@ -535,26 +559,45 @@ class LaserWindowAnalyzer(Node):
                 reason='直路测试：正前方候选检查通过' if straight is not None
                 else '直路测试：正前方没有合格候选，停止而不选择侧向通道',
             )
+        # 本帧出口先于行为仲裁更新。转弯使用自己的路径门控，不依赖旧巡航目标可用。
+        self.last_exits = self.exits.update(
+            self.last_plan.scan, self.last_feedback, stamp_ns, self.last_corridor)
         target = self.last_plan.target
+        heading = None if target is None else target.angle
         speed_scale = self.last_corridor.speed_scale \
             if self.reference_mode == 'corridor' and self.last_corridor is not None else 1.0
+        requested_speed = self.target_speed_mps * speed_scale
+        reference_id = self.reference_mode
+        reason = self.last_plan.reason
+        if self.reference_mode == 'corridor':
+            self.last_turn = self.turning.update(
+                self.last_plan.scan, self.last_feedback, stamp_ns, self.last_corridor,
+                self.last_exits, cruise_angle=heading)
+            turn = self.last_turn
+            if turn.reset_corridor:
+                # 仅重置拟合器；不能调用 _reset_corridor 取消正在执行的转弯。
+                self.corridor.reset()
+            if turn.active:
+                heading, reason = turn.heading_rad, turn.reason
+                requested_speed = min(self.target_speed_mps, turn.speed_mps)
+                reference_id = f'right_turn:{turn.exit_id}'
+                # 曲线目标不伪装成经过直线筛选的 Candidate，图形使用独立路径字段。
+                self.last_plan = replace(self.last_plan, target=None,
+                                         status=turn.status, reason=reason)
+        else:
+            self.last_turn = None
         reference = ControlReference(
             stamp_ns=stamp_ns,
-            heading_error_rad=None if target is None else target.angle,
-            target_speed_mps=self.target_speed_mps * speed_scale
-            if self.control_mode == 'closed_loop' else None,
-            stop_requested=target is None,
-            reason=self.last_plan.reason,
-            reference_id=self.reference_mode,
+            heading_error_rad=heading,
+            target_speed_mps=requested_speed if self.control_mode == 'closed_loop' else None,
+            stop_requested=heading is None,
+            reason=reason,
+            reference_id=reference_id,
         )
         self.last_control_input = ControlInput(reference, self.last_feedback)
         self.last_command = self.controller.compute(self.last_control_input)
-        self.status = self.last_plan.status if target is None else self.last_command.status
-        self.previous_target = target.angle if self.status in ('OK', 'CONTROL_WARMUP') else None
-        # 出口诊断与巡航目标独立：即使 CORRIDOR_LOST 停车，也可以短时观察侧向出口。
-        # 不用 preferred_id 替换当前目标；真正转弯还需要行为选择和弯曲路径检查。
-        self.last_exits = self.exits.update(
-            self.last_plan.scan, self.last_feedback, stamp_ns, self.last_corridor)
+        self.status = self.last_plan.status if heading is None else self.last_command.status
+        self.previous_target = heading if self.status in ('OK', 'CONTROL_WARMUP') else None
         return self.last_command.steer, self.last_command.speed
 
 def main(args=None):

@@ -26,7 +26,7 @@ def draw_steering(image, steer, center, limit, label, status, target_angle):
     _text(image, f'target={target}  {status}', 205)
 
 
-def draw_laser(result, config, status, steer, speed, label, command=None, corridor=None, exits=None):
+def draw_laser(result, config, status, steer, speed, label, command=None, corridor=None, exits=None, turn=None):
     """鸟瞰图：车头向上、车体左方在屏幕左方，与翻转后的 RGB 独立。"""
     image = np.full((1060 if exits is not None else 900, 800, 3), 23, dtype=np.uint8)
     origin = np.array([400.0, 500.0])
@@ -94,8 +94,38 @@ def draw_laser(result, config, status, steer, speed, label, command=None, corrid
             _text(image, f'finite={target.valid_ratio:.0%} no-return={target.no_return_ratio:.0%}'
                   f' mean(plan)={target.mean_distance_m:.2f}m'
                   f' inferred={target.inferred_ratio:.0%}', 144)
-        elif status != 'OK':
+        elif status != 'OK' and not (turn is not None and turn.active and turn.heading_rad is not None):
             _text(image, 'No active target; STOP output (see status / terminal)', 120, (70, 70, 240))
+
+    if turn is not None and turn.active:
+        offset = np.array((0., 0.) if exits is None else exits.sensor_offset_xy)
+        if turn.path_body:
+            path = np.array([pixel(*(np.array(p[:2])-offset)) for p in turn.path_body], np.int32)
+            cv2.polylines(image, [path], False, (190, 170, 120), 2)
+        if turn.swept_body:
+            # 显示实际检查的短程弧及其车体矩形；长参考路径不代表全段已观察自由。
+            poses = np.asarray(turn.swept_body)
+            radius = math.hypot(max(config.front_overhang_m, config.rear_overhang_m)
+                                + config.safety_margin_m,
+                                config.vehicle_width_m/2 + config.safety_margin_m)
+            delta_yaw = (np.diff(poses[:, 2])+math.pi) % (2*math.pi)-math.pi
+            inflation = .5*np.max(np.linalg.norm(np.diff(poses[:, :2], axis=0), axis=1)
+                                   + radius*np.abs(delta_yaw))
+            for x, y, yaw in turn.swept_body[::3]:
+                c, s = math.cos(yaw), math.sin(yaw)
+                rot = np.array([[c, -s], [s, c]])
+                m = config.safety_margin_m+inflation
+                corners = np.array([[config.front_overhang_m+m, config.vehicle_width_m/2+m],
+                                    [config.front_overhang_m+m, -config.vehicle_width_m/2-m],
+                                    [-config.rear_overhang_m-m, -config.vehicle_width_m/2-m],
+                                    [-config.rear_overhang_m-m, config.vehicle_width_m/2+m]])
+                box = np.array([pixel(*p) for p in corners @ rot.T + [x, y]-offset], np.int32)
+                cv2.polylines(image, [box], True, (0, 150, 0) if turn.status == 'OK' else (80, 80, 180), 1)
+        _text(image, f'behavior={turn.phase} locked=E{turn.exit_id} {turn.status}', 264, (230, 190, 90))
+        _text(image, f'planned curvature={turn.curvature_per_m:+.3f}/m | arc checked each scan', 288)
+        if turn.heading_rad is not None:
+            _text(image, f'curve reference={math.degrees(turn.heading_rad):+.1f}deg'
+                  f' speed cap={turn.speed_mps:.2f}m/s', 120, (255, 235, 0))
 
     if command is not None and command.diagnostics is not None:
         diag = command.diagnostics
@@ -166,6 +196,12 @@ def draw_laser(result, config, status, steer, speed, label, command=None, corrid
     if result is not None and result.target is not None and status == 'OK':
         cv2.arrowedLine(image, pixel(0, 0), ray(result.target.angle, config.lookahead_m),
                        (255, 235, 0), 3)
+
+    if turn is not None and turn.active and turn.heading_rad is not None and status == 'OK':
+        offset = np.array((0., 0.) if exits is None else exits.sensor_offset_xy)
+        cv2.arrowedLine(image, pixel(*(-offset)),
+                       pixel(*(np.array([math.cos(turn.heading_rad), math.sin(turn.heading_rad)])
+                               *0.65-offset)), (255, 235, 0), 3)
 
     cv2.circle(image, pixel(0, 0), round(config.radius_m * scale), (90, 150, 90), 1)
     rectangle = np.array([
