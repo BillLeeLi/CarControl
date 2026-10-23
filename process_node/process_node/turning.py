@@ -100,15 +100,13 @@ def check_swept_path(data, poses, planner, sensor_offset=(0., 0.), *, check_visi
     sensor = np.asarray(sensor_offset)
     points = np.column_stack((data.ranges[data.valid]*np.cos(data.angles[data.valid]),
                               data.ranges[data.valid]*np.sin(data.angles[data.valid]))) + sensor
-    radius = math.hypot(max(planner.front_overhang_m, planner.rear_overhang_m)
-                        + planner.safety_margin_m,
-                        planner.vehicle_width_m/2 + planner.safety_margin_m)
+    # 尺寸相对雷达测量，扫掠位姿却在 base_link 原点；矩形必须平移到同一坐标系。
+    padded_low, padded_high = planner.footprint_bounds(sensor, planner.safety_margin_m)
+    radius = float(np.linalg.norm(np.maximum(np.abs(padded_low), np.abs(padded_high))))
     # 任一相邻采样之间，车体任一点到较近采样位姿的位移不超过此上界。
     inflation = .5*np.max(np.linalg.norm(np.diff(poses[:, :2], axis=0), axis=1)
                            + radius*np.abs(wrap_angle(np.diff(poses[:, 2]))))
-    margin = planner.safety_margin_m + inflation
-    low = np.array([-planner.rear_overhang_m-margin, -planner.vehicle_width_m/2-margin])
-    high = np.array([planner.front_overhang_m+margin, planner.vehicle_width_m/2+margin])
+    low, high = padded_low-inflation, padded_high+inflation
     rays = np.column_stack((np.cos(data.bin_angles), np.sin(data.bin_angles)))
     # 膨胀相邻角箱深度取小，防止墙端/未知角箱在分箱边缘穿漏。
     near = (np.arange(len(rays))[:, None]+[-1, 0, 1]) % len(rays)
@@ -353,7 +351,13 @@ class RightTurnBehavior:
             reset_corridor = True  # 下一帧起拟合新道路，旧巡航模型不能充当完成依据。
         if self.phase == 'EXIT_ALIGN' and not reset_corridor:
             outbound = np.array([math.cos(self._out_heading), math.sin(self._out_heading)])
-            in_new_road = (pose-self._gate_world) @ outbound > self.planner.front_overhang_m
+            body_low, body_high = self.planner.footprint_bounds(
+                self.sensor_offset, self.planner.safety_margin_m)
+            # 雷达更靠近车头；完成判据须等车尾及裕量越过入口，不能只用较短的车头距离。
+            # 把完整矩形投影到出口方向，也计入尚未完全回正时车角的后向投影。
+            axis_body = outbound @ rot
+            back_projection = np.where(axis_body >= 0, body_low, body_high) @ axis_body
+            in_new_road = (pose-self._gate_world) @ outbound + back_projection > 0
             aligned = (in_new_road and out_error < math.radians(cfg.exit_heading_tolerance_deg)
                        and corridor is not None and corridor.status == 'CORRIDOR_TRACKING'
                        and corridor.usable and abs(corridor.heading_rad) < math.radians(cfg.exit_heading_tolerance_deg)

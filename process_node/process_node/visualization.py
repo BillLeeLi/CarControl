@@ -105,20 +105,17 @@ def draw_laser(result, config, status, steer, speed, label, command=None, corrid
         if turn.swept_body:
             # 显示实际检查的短程弧及其车体矩形；长参考路径不代表全段已观察自由。
             poses = np.asarray(turn.swept_body)
-            radius = math.hypot(max(config.front_overhang_m, config.rear_overhang_m)
-                                + config.safety_margin_m,
-                                config.vehicle_width_m/2 + config.safety_margin_m)
+            low, high = config.footprint_bounds(offset, config.safety_margin_m)
+            radius = float(np.linalg.norm(np.maximum(np.abs(low), np.abs(high))))
             delta_yaw = (np.diff(poses[:, 2])+math.pi) % (2*math.pi)-math.pi
             inflation = .5*np.max(np.linalg.norm(np.diff(poses[:, :2], axis=0), axis=1)
                                    + radius*np.abs(delta_yaw))
+            low, high = low-inflation, high+inflation
+            corners = np.array([[high[0], high[1]], [high[0], low[1]],
+                                [low[0], low[1]], [low[0], high[1]]])
             for x, y, yaw in turn.swept_body[::3]:
                 c, s = math.cos(yaw), math.sin(yaw)
                 rot = np.array([[c, -s], [s, c]])
-                m = config.safety_margin_m+inflation
-                corners = np.array([[config.front_overhang_m+m, config.vehicle_width_m/2+m],
-                                    [config.front_overhang_m+m, -config.vehicle_width_m/2-m],
-                                    [-config.rear_overhang_m-m, -config.vehicle_width_m/2-m],
-                                    [-config.rear_overhang_m-m, config.vehicle_width_m/2+m]])
                 box = np.array([pixel(*p) for p in corners @ rot.T + [x, y]-offset], np.int32)
                 cv2.polylines(image, [box], True, (0, 150, 0) if turn.status == 'OK' else (80, 80, 180), 1)
         _text(image, f'behavior={turn.phase} locked=E{turn.exit_id} {turn.status}', 264, (230, 190, 90))

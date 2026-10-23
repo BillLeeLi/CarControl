@@ -233,17 +233,21 @@ def test_no_return_distance_is_limited_by_sensor_range_and_can_be_disabled():
 
 def test_no_return_planning_distance_must_cover_the_whole_end_disk():
     cfg = PlannerConfig(no_return_distance_m=1.6)
-    result = analyze_scan(corridor_scan(), cfg)
+    scan = corridor_scan()
+    # 前半圈没有回波，真实墙点保留在后方用于整帧门控；不依赖旧车宽阻挡侧向有限点候选。
+    angles = np.arange(len(scan.ranges))*scan.angle_increment
+    scan.ranges[np.cos(angles) > 0] = np.inf
+    result = analyze_scan(scan, cfg)
     assert result.target is None
     assert result.status == 'NO_CLEAR_PATH'
 
 
 def test_candidate_generation_does_not_require_a_far_background_gap():
-    # 周围真实点距雷达 1.9 m，少于粗筛的 1.947 m；但圆盘沿直线仍可前移 1.5 m。
+    # 周围真实点距雷达 1.85 m，少于实测尺寸粗筛的约 1.882 m；仍可直行 1.5 m。
     # 去掉窗口中央的近角度点，得到可通过、而粗开口不足以容纳圆盘的场景。
     scan = make_scan()
     angles = wrap_angle(np.arange(len(scan.ranges)) * scan.angle_increment)
-    scan.ranges[:] = 1.9
+    scan.ranges[:] = 1.85
     scan.ranges[np.abs(angles) < math.radians(10)] = np.inf
     result = analyze_scan(scan, PlannerConfig())
     assert not result.gaps
@@ -278,3 +282,20 @@ def test_recorded_corridor_start_has_a_forward_candidate():
     assert any(abs(c.angle) < 1e-9 for c in result.candidates)
     assert abs(result.target.angle) < math.radians(6)
     assert result.target.clearance_m >= PlannerConfig().lookahead_m
+
+
+def test_measured_body_is_asymmetric_about_lidar_and_contains_all_corners():
+    config = PlannerConfig()
+    low, high = config.footprint_bounds()
+    # 2026-10-23 测量的矩形，雷达更靠近车头；不是长 42 cm 的居中矩形。
+    np.testing.assert_allclose(low, [-.26, -.11])
+    np.testing.assert_allclose(high, [.16, .11])
+    assert high[0]-low[0] == pytest.approx(.42)
+    for corner in ((-.26, -.11), (-.26, .11), (.16, -.11), (.16, .11)):
+        assert math.hypot(*corner) + config.safety_margin_m <= config.radius_m + 1e-12
+
+
+def test_lidar_relative_dimensions_are_translated_to_base_link():
+    low, high = PlannerConfig().footprint_bounds(sensor_offset=(.20, -.10), margin_m=.10)
+    np.testing.assert_allclose(low, [-.16, -.31])
+    np.testing.assert_allclose(high, [.46, .11])

@@ -155,6 +155,13 @@ def test_kinematic_right_turn_runs_all_four_phases_and_reacquires_new_road(gate_
     assert y < -1.4 and abs(yaw+math.pi/2) < math.radians(15)
     assert abs(x-2.3) < .3
     assert b._passed
+    from process_node.turning import rotation
+    low, high = b.planner.footprint_bounds(b.sensor_offset, b.planner.safety_margin_m)
+    corners = np.array([[low[0], low[1]], [low[0], high[1]],
+                        [high[0], low[1]], [high[0], high[1]]])
+    gate, out_heading = b._passed[0]
+    world_corners = corners @ rotation(yaw).T+[x, y]
+    assert np.min((world_corners-gate) @ [math.cos(out_heading), math.sin(out_heading)]) > 0
     # 同位置同方向的完成入口换编号后，也不能被重复当成新转弯。
     old_gate, old_heading = b._passed[0]
     local = (old_gate-[x, y]) @ np.array([[math.cos(yaw), -math.sin(yaw)],
@@ -179,7 +186,7 @@ def test_turn_curve_detects_an_obstacle_that_is_outside_a_straight_sweep():
 def test_curve_checks_rear_swing_not_just_vehicle_center():
     p = PlannerConfig(rear_overhang_m=.7)
     data = raycast([((-4., 3.), (4., 3.)), ((-4., -3.), (4., -3.)),
-                    ((-.55, .45), (-.50, .45))])
+                    ((-.55, .35), (-.50, .35))])
     assert check_swept_path(data, arc_poses(0., .6, .02), p)[0]
     assert not check_swept_path(data, arc_poses(-1., .6, .02), p)[0]
 
@@ -228,3 +235,16 @@ def test_fillet_headings_remain_continuous_across_angle_seam():
     path, _, _ = fillet_path((0., 0.), axis, 0., obs, .8, TurnConfig())
     assert np.max(np.abs(np.diff(path[:, 2]))) < .06
     assert path[-1, 2] == pytest.approx(math.radians(-260))
+
+
+@pytest.mark.parametrize('sensor,obstacle', [
+    ((.20, 0.), ((.32, -.02), (.32, .02))),
+    ((-.20, 0.), ((-.40, -.02), (-.40, .02))),
+    ((0., .10), ((-.02, .18), (.02, .18))),
+])
+def test_translated_body_checks_front_rear_and_side_in_base_link(sensor, obstacle):
+    # 障碍落在平移后的实测车身内，却不在以 base_link 为中心的旧错误矩形内。
+    planner = PlannerConfig(safety_margin_m=0.)
+    data = raycast([((-5., 2.), (5., 2.)), ((-5., -2.), (5., -2.)), obstacle], sensor=sensor)
+    safe, reason = check_swept_path(data, arc_poses(0., .02, .01), planner, sensor)
+    assert not safe and '真实障碍' in reason

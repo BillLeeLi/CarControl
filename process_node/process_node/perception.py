@@ -13,12 +13,14 @@ def wrap_angle(angle):
 
 @dataclass(frozen=True)
 class PlannerConfig:
-    """这些几何默认值只供离线分析，上车前必须按实际车辆测量。"""
+    """车体尺寸取自用户测量；安装偏移、安全裕量和其他阈值仍需核验。"""
 
     sensor_yaw_offset_deg: float = 0.0  # 雷达到车体坐标的安装偏角（度），正值逆时针
-    vehicle_width_m: float = 0.35  # 车体总宽（米），用于计算车体包络圆盘
-    front_overhang_m: float = 0.30  # 从雷达到车头最前端的距离（米）
-    rear_overhang_m: float = 0.15  # 从雷达到车尾最后端的距离（米）
+    # 2026-10-23 用户测量：宽约 22 cm，雷达位于宽度中线，前 15–16 / 后 25–26 cm。
+    # 前后距离取测量上限，构成 0.42 m 长的矩形；不把雷达误当作车长中点。
+    vehicle_width_m: float = 0.22  # 车体总宽（米），雷达位于宽度中线
+    front_overhang_m: float = 0.16  # 沿车头方向，从雷达到车头最前端的距离（米）
+    rear_overhang_m: float = 0.26  # 沿车尾方向，从雷达到车尾最后端的距离（米）
     safety_margin_m: float = 0.10  # 车体包络圆盘外额外增加的安全裕量（米）
     lookahead_m: float = 1.50  # 要检查的圆盘中心沿候选方向前移的距离（米）
     max_distance_m: float = 5.0  # 净空、评分和显示的距离上限（米）
@@ -72,6 +74,18 @@ class PlannerConfig:
             self.vehicle_width_m / 2,
             max(self.front_overhang_m, self.rear_overhang_m),
         ) + self.safety_margin_m
+
+    def footprint_bounds(self, sensor_offset=(0., 0.), margin_m=0.):
+        """将雷达参照的车体矩形转为车体原点参照，返回 (x,y) 的下界/上界。
+
+        sensor_offset 是雷达在 base_link 中的位置，不是矩形中心的位置。
+        测得雷达在车宽中线，因此雷达参照的左右边界为 ±车宽/2。
+        扫描角已转到车头方向；此处仅转换原点，不重复旋转安装偏角。
+        """
+        sensor = np.asarray(sensor_offset, dtype=float)
+        low = sensor + [-self.rear_overhang_m-margin_m, -self.vehicle_width_m/2-margin_m]
+        high = sensor + [self.front_overhang_m+margin_m, self.vehicle_width_m/2+margin_m]
+        return low, high
 
 
 @dataclass

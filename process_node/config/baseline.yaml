@@ -23,10 +23,12 @@
     odom_scan_tolerance_s: 0.15
     odom_history_s: 2.0
     sensor_yaw_offset_deg: 0.0
-    vehicle_width_m: 0.35
-    front_overhang_m: 0.30
-    rear_overhang_m: 0.15
-    safety_margin_m: 0.10
+    # 2026-10-23 实测，前后距离取上限：车体约 0.22 m 宽、0.42 m 长。
+    # 雷达在宽度中线；这两个前后距离都相对雷达，不是相对 base_link。
+    vehicle_width_m: 0.22
+    front_overhang_m: 0.16
+    rear_overhang_m: 0.26
+    safety_margin_m: 0.10  # 额外裕量独立于车体实测尺寸
     lookahead_m: 1.50
     max_distance_m: 5.0
     # +inf 按“此有限规划范围内未命中”参与候选；原始 ranges 仍保留 inf。
