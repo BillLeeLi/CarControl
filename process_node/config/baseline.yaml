@@ -2,7 +2,7 @@
 /**:
   ros__parameters:
     sensorTopic: /sync_store_node/allsensor
-    group_label: midterm-recovery-v6
+    group_label: midterm-z-turn-v7
     show_visualization: true
     input_odom_queue_size: 200  # 独立接收线程的有界缓存；主线程先批量更新里程计
     visualization_period_s: 0.1  # 最多 10 Hz 刷新图像，窗口/按键事件仍持续处理
@@ -116,9 +116,24 @@
     exit_corner_wall_span_m: 0.35
     exit_corner_match_distance_m: 1.2
     exit_corner_match_angle_deg: 60.0
-    # 单个右转：CRUISE -> APPROACH -> TURN -> EXIT_ALIGN -> CRUISE。
+    exit_corner_road_enabled: true
+    exit_corner_road_line_tolerance_m: 0.06
+    # 左右转共用四阶段；左转先 LEFT_CONFIRM，短 Z 可在中间进入 CHAIN_TURN。
     # 以下为离线初值；min_radius、PD 响应与停车减速度必须实车核验。
     turn_enabled: true  # false 恢复仅巡航；perception/straight 模式自动不接管
+    turn_left_enabled: true  # 已确认左出口 + 真实横墙封闭；普通左门/前方未知不触发
+    turn_chain_enabled: true  # 第一左弯中确认第二右出口后可直接衔接，不强求回中
+    turn_left_confirm_frames: 3
+    turn_left_confirm_time_s: 0.20
+    turn_front_block_width_ratio: 0.60
+    turn_front_block_band_m: 0.20
+    turn_chain_search_distance_m: 3.0
+    turn_chain_context_timeout_s: 5.0
+    turn_chain_context_travel_m: 2.0
+    turn_chain_prepare_angle_deg: 40.0
+    turn_chain_return_tolerance_deg: 25.0
+    turn_chain_tail_m: 0.65
+    turn_chain_max_duration_s: 90.0
     turn_approach_speed_mps: 0.10
     turn_speed_mps: 0.10
     turn_activate_distance_m: 3.5

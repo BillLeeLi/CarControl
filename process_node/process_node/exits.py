@@ -45,10 +45,12 @@ class ExitConfig:
     corner_wall_span_m: float = 0.35  # 墙端附近真实线段的最低跨度（米）
     corner_match_distance_m: float = 1.2  # 疑似墙端与后续入口中心的关联容差（米）
     corner_match_angle_deg: float = 60.0  # 疑似斜向开口升级为侧向入口时的方向容差（度）
+    corner_road_enabled: bool = True  # 横墙与转角后平行墙段共同支持的有限宽入口
+    corner_road_line_tolerance_m: float = .06  # 两条近似纵向边界的真实点拟合容差
 
     def __post_init__(self):
         for name, value in vars(self).items():
-            if name in ('enabled', 'prefer_right', 'corner_enabled'):
+            if name in ('enabled', 'prefer_right', 'corner_enabled', 'corner_road_enabled'):
                 if type(value) is not bool:
                     raise ValueError(f'exit_{name} 必须为布尔值')
                 continue
@@ -83,6 +85,7 @@ class ExitObservation:
     confidence: float  # 几何/结构诊断分数，不是概率或碰撞安全保证
     clipped: bool = False  # 可见入口触及搜索边界，宽度尚未完整观测
     depth_visible_ratio: float = 1.0  # 可见入口中能观测到完整纵深的比例；不等于可通行宽度
+    basis: str = 'PORTAL'  # PORTAL 截面 / WALL_PAIR 平行墙段 / CORNER_PAIR 横墙与真实墙端
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,15 @@ class TrackedExit:
     side: str  # 相对当前接近走廊的 LEFT / FORWARD / RIGHT / BEHIND
     age_s: float  # 距最近实际观测的消息时间（秒）；HELD 不参与推荐
     hits: int  # 连续具有真实结构支持的观测次数
+
+
+@dataclass(frozen=True)
+class ExitApproach:
+    """已锁定道路入口提供的诊断坐标；不充当巡航墙线或自由空间证据。"""
+
+    axis_rad: float  # 在当前车体坐标中的道路方向
+    center_left_m: float  # 当前原点到道路中线的有符号距离
+    width_m: float  # 已确认入口的可见宽度估计，仍需本帧真实边界重新验证
 
 
 @dataclass(frozen=True)
@@ -298,6 +310,76 @@ def detect_exits(data, config, axis_rad, center_left_m, width_m, sensor_offset=(
     return observations
 
 
+def detect_corner_roads(data, config, approach, sensor_offset=(0., 0.), side=1):
+    """短 Z 中入口截面可能连入下一道路；用两条真实墙段界定宽度。
+
+    需要前方真实横墙跨过车道中心、转角后平行墙或当前侧墙真实端点，以及可见纵深。
+    隐藏的后墙不假装已观测到；端点必须由整段真实侧墙的终止支持，不能用搜索边界截断。
+    """
+    cfg = config
+    if not cfg.corner_road_enabled:
+        return []
+    rot = _rotation(approach.axis_rad)
+    sensor = np.asarray(sensor_offset)
+    points = np.column_stack((data.ranges[data.valid]*np.cos(data.angles[data.valid]),
+                              data.ranges[data.valid]*np.sin(data.angles[data.valid])))+sensor
+    points = points @ rot
+    center, width = approach.center_left_m, approach.width_m
+    boundary = center+side*width/2
+    output, seen = [], []
+    for front in np.arange(.3, cfg.search_front_m, .15):
+        cross = points[(np.abs(points[:, 0]-front)<cfg.wall_band_m)
+                       & (np.abs(points[:, 1]-center)<width*.45)]
+        if len(cross)<cfg.min_wall_points:
+            continue
+        u = float(np.median(cross[:, 0]))
+        cross = cross[np.abs(cross[:, 0]-u)<cfg.corner_road_line_tolerance_m]
+        if (len(cross)<cfg.min_wall_points or np.ptp(cross[:, 1])<width*.55
+                or cross[:, 1].min()>center-width*.1 or cross[:, 1].max()<center+width*.1
+                or any(abs(u-old)<.15 for old in seen)):
+            continue
+        seen.append(u)
+        boundaries = []
+        edge = points[(np.abs(points[:, 1]-boundary)<cfg.corner_road_line_tolerance_m)
+                      & (points[:, 0]>-cfg.search_rear_m) & (points[:, 0]<u-cfg.clearance_m)]
+        if len(edge)>=cfg.min_wall_points and np.ptp(edge[:, 0])>=cfg.min_wall_span_m:
+            endpoint = float(edge[:, 0].max())
+            local = edge[edge[:, 0]>endpoint-cfg.corner_wall_radius_m]
+            if len(local)>=cfg.min_wall_points and np.ptp(local[:, 0])>=cfg.min_wall_span_m:
+                boundaries.append((endpoint, local, 'CORNER_PAIR'))
+        for inner in np.arange(max(-cfg.search_rear_m, u-cfg.max_width_m), u-cfg.min_width_m+.01, .15):
+            wall = points[(np.abs(points[:, 0]-inner)<cfg.wall_band_m)
+                          & (side*(points[:, 1]-boundary)>.05)
+                          & (side*(points[:, 1]-boundary)<cfg.probe_depth_m+1.)]
+            if len(wall)<cfg.min_wall_points:
+                continue
+            inner_u = float(np.median(wall[:, 0]))
+            wall = wall[np.abs(wall[:, 0]-inner_u)<cfg.corner_road_line_tolerance_m]
+            if (len(wall)<cfg.min_wall_points or np.ptp(wall[:, 1])<cfg.min_wall_span_m
+                    or not cfg.min_width_m <= u-inner_u <= cfg.max_width_m):
+                continue
+            boundaries.insert(0, (inner_u, wall, 'WALL_PAIR'))
+        for inner_u, wall, basis in boundaries:
+            portal_width = u-inner_u
+            if not cfg.min_width_m <= portal_width <= cfg.max_width_m:
+                continue
+            lateral = np.linspace(inner_u+cfg.clearance_m, u-cfg.clearance_m,
+                                  max(3, math.ceil(portal_width/cfg.sample_step_m)))
+            depth = np.linspace(cfg.clearance_m, cfg.probe_depth_m,
+                                max(3, math.ceil(cfg.probe_depth_m/cfg.sample_step_m)))
+            grid = np.stack(np.broadcast_arrays(lateral[:, None], boundary+side*depth[None, :]), axis=-1)
+            free = _known_free(data, grid @ rot.T, sensor, cfg.clearance_m)
+            ratio = float(np.mean(free.all(axis=1)))
+            if free[:, 0].mean()<.5 or ratio<cfg.min_depth_visible_ratio:
+                continue
+            output.append(ExitObservation(tuple(np.array([(u+inner_u)/2, boundary]) @ rot.T),
+                          float(wrap_angle(approach.axis_rad+side*math.pi/2)), portal_width,
+                          cfg.probe_depth_m, 'SIDE', True, len(wall)+len(cross), .7,
+                          depth_visible_ratio=ratio, basis=basis))
+            break
+    return output
+
+
 class ExitTracker:
     """入口保存在 odom 坐标；短时丢失只保留编号，不把历史入口推荐给控制。"""
 
@@ -314,7 +396,8 @@ class ExitTracker:
         self._previous_ns = None
         self._context = None  # 世界航向、中线偏移、宽度、更新时间、当时车辆位置
 
-    def update(self, data, feedback, stamp_ns, corridor=None):
+    def update(self, data, feedback, stamp_ns, corridor=None, approach=None,
+               additional_observations=(), only_additional=False):
         cfg = self.config
         if not cfg.enabled:
             self.reset()
@@ -347,10 +430,25 @@ class ExitTracker:
                     or np.linalg.norm(pose - last_pose) > cfg.context_travel_m):
                 self._context = None
         context_valid = self._context is not None
+        if approach is not None:
+            values = (approach.axis_rad, approach.center_left_m, approach.width_m)
+            if not all(math.isfinite(v) for v in values) or approach.width_m <= 0:
+                return ExitResult('EXIT_INPUT_INVALID', '出口接近坐标无效')
+            # 本帧覆写只供连弯诊断，不延长真实走廊历史，不伪造 TRACKING。
+            heading = yaw+approach.axis_rad
+            offset = approach.center_left_m+np.array([-math.sin(heading), math.cos(heading)]) @ pose
+            width = approach.width_m
+            context_valid = True
         if context_valid:
             axis = float(wrap_angle(heading-yaw))
             center = offset - np.array([-math.sin(heading), math.cos(heading)]) @ pose
-            observations = detect_exits(data, cfg, axis, center, width, self.sensor_offset)
+            observations = [] if only_additional else detect_exits(
+                data, cfg, axis, center, width, self.sensor_offset)
+            if additional_observations:
+                observations = list(additional_observations)+[o for o in observations if not any(
+                    np.linalg.norm(np.asarray(o.center_xy)-a.center_xy)<cfg.match_distance_m
+                    and abs(wrap_angle(o.heading_rad-a.heading_rad))<math.radians(cfg.match_angle_deg)
+                    for a in additional_observations)]
         else:
             # 墙端线索由当前真实点和可见自由区域直接支持，不需要假设道路宽度。
             # 没有可信走廊时仅以当前车头划分左右；不生成可确认的 SIDE/FORWARD。
@@ -413,7 +511,7 @@ class ExitTracker:
                 side = 'LEFT' if lateral > 0 else 'RIGHT'
             obs = ExitObservation(tuple(body), relative_heading, old.width_m, old.depth_m,
                                   old.role, old.structural, old.wall_points, old.confidence,
-                                  old.clipped, old.depth_visible_ratio)
+                                  old.clipped, old.depth_visible_ratio, old.basis)
             status = 'HELD' if age > 0 else ('CONFIRMED' if track.confirmed else
                                           ('SUSPECTED' if old.role == 'CORNER_HINT' else
                                            ('TENTATIVE' if old.structural else 'UNVERIFIED')))

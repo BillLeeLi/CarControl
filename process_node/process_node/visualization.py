@@ -127,6 +127,19 @@ def draw_laser(result, config, status, steer, speed, label, command=None, corrid
         if curve.heading_rad is not None:
             _text(image, f'curve reference={math.degrees(curve.heading_rad):+.1f}deg'
                   f' speed cap={curve.speed_mps:.2f}m/s', 120, (255, 235, 0))
+        if curve is turn:
+            locked = f'Z{turn.exit_id}' if turn.chain_stage == 2 else (
+                f'C{-turn.exit_id}' if turn.exit_id is not None and turn.exit_id < 0 else f'E{turn.exit_id}')
+            _text(image, f'side={turn.side} leg={turn.chain_stage} locked={locked} {turn.entry_basis}', 144)
+            track = turn.chain_exit
+            if track is not None and turn.chain_stage == 1:
+                obs = track.observation
+                center = np.asarray(obs.center_xy)-offset
+                normal = np.array([-math.sin(obs.heading_rad), math.cos(obs.heading_rad)])
+                cv2.line(image, pixel(*(center-normal*obs.width_m/2)),
+                         pixel(*(center+normal*obs.width_m/2)), (80, 220, 255), 2)
+                cv2.putText(image, f'Z{track.track_id} {track.state}', pixel(*center),
+                            cv2.FONT_HERSHEY_SIMPLEX, .42, (80, 220, 255), 1, cv2.LINE_AA)
 
     if command is not None and command.diagnostics is not None:
         diag = command.diagnostics

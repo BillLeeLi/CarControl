@@ -141,10 +141,13 @@ ros2 launch process_node process_node.launch.py config:=src/process_node/config/
 
 ### 当前配置中需要记住的内容
 
-- 当前标签 `midterm-recovery-v6`，默认 `closed_loop + corridor`，巡航目标 0.2 m/s，右转上限 0.1 m/s，局部恢复默认开启、上限 0.06 m/s。首次直路标定可设 `turn_enabled: false`、`recovery_enabled: false` 和较低目标速度；中位/速度测试用 `reference_mode: straight`。
+- v7 新增左转与左后右短 Z，默认 `turn_left_enabled=true`、`turn_chain_enabled=true`；只在有真实道路证据时自动衔接，无需切换 reference_mode。要先测试旧的单右转，可把两项设为 false。仍只需复制整个 process_node，按原步骤编译启动，无新增依赖/命令。
+- 新图例：`C编号` 是补充边界证据确认的第一入口（日志编号为负），`Z编号` 是独立跟踪的第二出口；`side/chain_stage/entry_basis` 显示当前方向、腿和证据。`TURN_LEFT_CONFIRMING`、`TURN_CHAIN_WAITING` 都停车；第二腿 CHAIN_TURN 通过同样的短弧整车检查才输出控制。具体参数见 TUNING。
+
+- 当前标签 `midterm-z-turn-v7`，默认 `closed_loop + corridor`，巡航目标 0.2 m/s，右转上限 0.1 m/s，局部恢复默认开启、上限 0.06 m/s。首次直路标定可设 `turn_enabled: false`、`recovery_enabled: false` 和较低目标速度；中位/速度测试用 `reference_mode: straight`。
 - 实测尺寸为宽 0.22 m、雷达到车头 0.16 m、到车尾 0.26 m，安全裕量保持 0.10 m。旧的现场专用 YAML 可能仍覆盖为旧尺寸，应核对。
 - 前后距离统一相对雷达定义，转弯矩形按 `corridor_sensor_x_m/y_m` 转到 base_link；实际安装平移仍未确认。控制中位、符号、增益、动力死区、最小转弯半径和停车能力仍需实车标定，不能由车体尺寸推定。
-- 当前能执行走廊巡航和单个右转；左转、短 Z 衔接、S 弯绕障和终点判断未完成。具体参数和图例见 [README.md](README.md)。
+- 当前能执行走廊巡航、左右转及短 Z 衔接和局部恢复；S 弯绕障尚未完成，终点自动停车暂缓、结束手动接管。具体参数和图例见 [README.md](README.md)。
 - `TURN_BLOCKED` 先停车；参考/旧路径问题可进入局部恢复，经停车、低速反馈和安全短弧连续确认后才动作。图中 `RECOVERY/阶段` 和日志 `recovery/cause/reason` 表示恢复正在仲裁；原 `turn_status=TURN_FAULT` 不一定仍要求永久停车，应结合恢复结果看。
 - `RECOVERY_NO_GUIDE` / `RECOVERY_BLOCKED` 表示缺少可信方向或安全短弧，继续停车。`RECOVERY_COMPLETE` 连续确认交回巡航；不可恢复的 `TURN_FAULT` 和 `RECOVERY_FAULT` 仍需记录原因、人工检查后重启。不要通过放宽时间/路径门控解除故障。`recovery_enabled: false` 可关闭新增行为，其他启动命令不变。
 
@@ -167,7 +170,7 @@ ros2 launch process_node process_node.launch.py config:=src/process_node/config/
 1. 编译、导入、launch、无输入等待及正常退出：不需要小车或 bag；无输入停车是预期结果。
 2. 接收传感器、计算控制、窗口更新及超时停车：需要另外提供课程 bag 或实车输入。干净容器的结果不能代替车辆控制响应标定。
 
-已有本地验证：当前 v6 已构建成功，通过 **302 项功能测试**，含局部恢复及软故障交回巡航；有界小消息与真实双窗口回放检查通过，后者未执行恢复动作。此前 v5 两窗口回放观察到完整单右转交接。**尚未按本次 U 盘流程在新建干净容器或助教设备上重新验证**；验证后应把镜像、依赖差异、工作区路径和结果回填本文。具体帧数、能力和限制保留在 README，避免现场操作文档过长。
+已有本地验证：v7 已构建成功，**330 项功能测试通过**，包括左右转/Z 的几何闭环与真实节点集成。课程实际 Z 的独立 scan/odom 有界重放完整经过左转、右接、最终交回巡航。**原始 AllSensor 双窗口回放未完整通过 Z**：该区间有多次真实录制间隔 >0.5 s，确认被打断，录制位姿继续移动又使恢复路程耗尽，程序停车；保持保护阈值，详见 README。**尚未按 U 盘流程在新建干净容器或助教设备上验证**，不能将独立扫描、GUI 显示或理想曲率积分当作实车闭环成功。后续需回填镜像、依赖差异和现场结果。
 
 ---
 
@@ -253,7 +256,8 @@ python3 -m pytest src/process_node/test/test_perception.py \
   src/process_node/test/test_input_buffer.py \
   src/process_node/test/test_exits.py src/process_node/test/test_node_exits.py \
   src/process_node/test/test_turning.py src/process_node/test/test_node_turning.py \
-  src/process_node/test/test_recovery.py src/process_node/test/test_node_recovery.py -q
+  src/process_node/test/test_recovery.py src/process_node/test/test_node_recovery.py \
+  src/process_node/test/test_z_turning.py src/process_node/test/test_node_z_turning.py -q
 ```
 
 ### B.4 录制数据离线回放

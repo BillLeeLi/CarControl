@@ -29,7 +29,7 @@ from process_node.pid_controller import PIDConfig, PIDController
 from process_node.perception import PlannerConfig, analyze_scan, analyze_prepared_scan, prepare_scan
 from process_node.visualization import draw_laser, draw_steering
 from process_node.window_monitor import create_window_monitor
-from process_node.turning import RightTurnBehavior, TurnConfig, TurnResult
+from process_node.turning import TurnBehavior, TurnConfig, TurnResult
 from process_node.recovery import LocalRecoveryBehavior, RecoveryConfig
 
 
@@ -51,7 +51,7 @@ class LaserWindowAnalyzer(Node):
             }
         )
         self.declare_parameter("sensorTopic", "/sync_store_node/allsensor")
-        self.declare_parameter("group_label", "midterm-recovery-v6")
+        self.declare_parameter("group_label", "midterm-z-turn-v7")
         self.declare_parameter("show_visualization", True)
         self.declare_parameter("control_mode", "closed_loop")
         self.declare_parameter("reference_mode", "corridor")
@@ -118,8 +118,8 @@ class LaserWindowAnalyzer(Node):
         })
         if max(turn_config.speed_mps, turn_config.approach_speed_mps) > pid_config.max_target_speed_mps:
             raise ValueError('turn 速度不能超过 max_target_speed_mps')
-        self.turning = RightTurnBehavior(turn_config, self.config,
-                                         sensor_offset=self.exits.sensor_offset)
+        self.turning = TurnBehavior(turn_config, self.config,
+                                   sensor_offset=self.exits.sensor_offset, exit_config=self.exits.config)
         self.last_turn = None
         recovery_defaults = RecoveryConfig()
         for item in fields(recovery_defaults):
@@ -366,6 +366,8 @@ class LaserWindowAnalyzer(Node):
         if self.last_turn is not None:
             turn = self.last_turn
             control_text += (f' | behavior={turn.phase} turn_status={turn.status}'
+                             f' side={turn.side} chain={turn.chain_stage}'
+                             f' entry_basis={turn.entry_basis}'
                              f' locked_exit={turn.exit_id} curvature={turn.curvature_per_m:+.3f}/m'
                              f' ({turn.reason})')
         if self.last_recovery is not None:
@@ -617,7 +619,7 @@ class LaserWindowAnalyzer(Node):
             if turn.active:
                 heading, reason = turn.heading_rad, turn.reason
                 requested_speed = min(self.target_speed_mps, turn.speed_mps)
-                reference_id = f'right_turn:{turn.exit_id}'
+                reference_id = f'{turn.side.lower()}_turn:{turn.exit_id}:leg{turn.chain_stage}'
                 # 曲线目标不伪装成经过直线筛选的 Candidate，图形使用独立路径字段。
                 self.last_plan = replace(self.last_plan, target=None,
                                          status=turn.status, reason=reason)

@@ -19,7 +19,7 @@ from process_node.exits import ExitConfig, ExitTracker
 from process_node.motion import MotionConfig, MotionEstimator
 from process_node.perception import PlannerConfig, analyze_prepared_scan, prepare_scan
 from process_node.visualization import draw_laser
-from process_node.turning import RightTurnBehavior, TurnResult
+from process_node.turning import TurnBehavior, TurnResult
 from process_node.recovery import LocalRecoveryBehavior, RecoveryConfig
 
 
@@ -30,8 +30,8 @@ def main():
     parser.add_argument('--duration', type=float, default=30., help='分析时长，最多 120 秒')
     parser.add_argument('--scan-stride', type=int, default=1, help='每 N 帧扫描处理一帧，里程计不跳过')
     parser.add_argument('--output', type=Path, required=True, help='仓库外的结果目录')
-    parser.add_argument('--turns', action='store_true', help='同时运行右转几何行为；不运行 PID、不发布控制')
-    parser.add_argument('--recovery', action='store_true', help='同时运行右转与局部恢复几何行为，不运行 PID')
+    parser.add_argument('--turns', action='store_true', help='同时运行左右转/Z 几何行为；不运行 PID、不发布控制')
+    parser.add_argument('--recovery', action='store_true', help='同时运行转弯与局部恢复几何行为，不运行 PID')
     args = parser.parse_args()
     args.turns = args.turns or args.recovery
     if not 0 < args.duration <= 120 or args.offset < 0 or args.scan_stride < 1:
@@ -56,7 +56,8 @@ def main():
         corridor = CorridorTracker(CorridorConfig())
         tracker = ExitTracker(ExitConfig())
         motion = MotionEstimator(MotionConfig())
-        turning = RightTurnBehavior(planner=planner)
+        turning = TurnBehavior(planner=planner)
+        directions = Counter()
         recovery = LocalRecoveryBehavior(RecoveryConfig(), planner, turning.config) if args.recovery else None
         recovery_states = Counter()
         turn_states = Counter()
@@ -71,7 +72,8 @@ def main():
             writer.writerow(['bag_s', 'odom', 'corridor', 'exits', 'suggestion', 'preferred_id', 'tracks',
                              'scan_dt_s', 'fitted_walls', 'corridor_reason', 'yaw_deg',
                              'behavior', 'turn_status', 'locked_exit', 'curvature', 'turn_reason',
-                             'recovery_phase', 'recovery_status', 'recovery_reason', 'recovery_cause'])
+                             'recovery_phase', 'recovery_status', 'recovery_reason', 'recovery_cause',
+                             'turn_side', 'chain_stage', 'next_exit'])
             for timestamp, topic, blob in rows:
                 payload += len(blob)
                 received = (timestamp-start)*1e-9
@@ -102,6 +104,8 @@ def main():
                                           estimate.target_angle_rad if estimate.usable else None) if args.turns else None
                 if turn is not None:
                     turn_states[turn.phase+':'+turn.status] += 1
+                    if turn.active:
+                        directions[f'{turn.side}:leg{turn.chain_stage}'] += 1
                     if turn.reset_corridor:
                         corridor.reset()
                 recovered = None
@@ -143,12 +147,15 @@ def main():
                                  '' if recovered is None else recovered.phase,
                                  '' if recovered is None else recovered.status,
                                  '' if recovered is None else recovered.reason,
-                                 '' if recovered is None else recovered.cause])
+                                 '' if recovered is None else recovered.cause,
+                                 '' if turn is None else turn.side,
+                                 '' if turn is None else turn.chain_stage,
+                                 '' if turn is None or turn.chain_exit is None else turn.chain_exit.track_id])
                 previous_stamp = stamp
                 count += 1
                 states[result.status] += 1
                 recommendations[result.recommendation] += 1
-                signature = (None if turn is None else (turn.phase, turn.status),
+                signature = (None if turn is None else (turn.phase, turn.status, turn.side, turn.chain_stage),
                              None if recovered is None else (recovered.phase, recovered.status),
                              tuple((t.side, t.state) for t in result.tracks))
                 if received-last_picture >= 5 or (signature != previous_signature
@@ -163,6 +170,7 @@ def main():
         summary = dict(scans=count, scan_messages=seen_scans, payload_bytes=payload, status=dict(states),
                        suggestions=dict(recommendations), turns=dict(turn_states),
                        recovery=dict(recovery_states),
+                       turn_directions=dict(directions),
                        perception_ms_median=float(np.median(costs)) if costs else None,
                        perception_ms_p95=float(np.percentile(costs, 95)) if costs else None,
                        note='独立 /scan，默认配置，未运行控制器；不能等同 AllSensor 实时控制或实车结果')
