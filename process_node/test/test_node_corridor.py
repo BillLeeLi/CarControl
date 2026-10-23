@@ -95,10 +95,12 @@ def test_single_wall_and_missing_walls_reduce_speed_then_expire(node):
     assert node.last_control_input.reference.target_speed_mps == .1
     for t in (100.6, 100.7, 100.8):
         tick(node, t, modify=missing)
-    assert node.status == 'CORRIDOR_LOST'
+    assert node.last_corridor.status == 'CORRIDOR_LOST'
+    assert node.status.startswith('RECOVERY_')
     assert node.speed_value == node.stop_speed
     tick(node, 100.9)
-    assert node.status == 'CORRIDOR_ACQUIRING'
+    assert node.last_corridor.status == 'CORRIDOR_ACQUIRING'
+    assert node.last_recovery.heading_rad is None
 
 
 def test_side_candidates_do_not_bypass_a_blocked_cruise_reference(node):
@@ -107,7 +109,8 @@ def test_side_candidates_do_not_bypass_a_blocked_cruise_reference(node):
         msg.urg.ranges[0] = 1.3
     tick(node, 100.4, modify=obstacle)
     assert node.last_plan.candidates
-    assert node.status == 'CRUISE_BLOCKED'
+    assert node.last_recovery.cause == 'CRUISE_BLOCKED'
+    assert node.status == 'RECOVERY_WAITING'
     assert node.last_plan.target is None
     assert node.speed_value == node.stop_speed
     tick(node, 100.5)

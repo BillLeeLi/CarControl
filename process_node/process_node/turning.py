@@ -28,7 +28,7 @@ class TurnConfig:
     reaction_time_s: float = 0.30  # 估算停车距离所用的响应延迟
     braking_decel_mps2: float = 0.30  # 停车距离估计减速度，需实测核验
     exit_extension_m: float = 1.50  # 圆角末端/入口后继续延伸的对齐参考长度
-    max_tracking_error_m: float = 0.55  # 偏离锁定路径超过此距离则锁存故障停车
+    max_tracking_error_m: float = 0.55  # 偏离锁定路径则停止追踪，允许独立恢复重新检查
     min_angle_deg: float = 55.0  # 可接受的右出口相对接近道路转角下限
     max_angle_deg: float = 125.0  # 可接受的右出口相对接近道路转角上限
     hint_timeout_s: float = 0.50  # 疑似出口暂失多久后取消接近行为
@@ -72,6 +72,7 @@ class TurnResult:
     path_body: tuple = ()  # odom 锁定参考在本帧车体坐标中的采样 (x,y,yaw)
     swept_body: tuple = ()  # 本帧实际检查的短程圆弧采样 (x,y,yaw)
     reset_corridor: bool = False  # 进入出口对齐时要求重新确认新走廊
+    recoverable: bool = False  # 仅路径问题/短暂输入中断可交给独立恢复行为
 
 
 def arc_poses(curvature, distance, step):
@@ -194,20 +195,43 @@ class RightTurnBehavior:
         self._align_hits = 0
         self._passed = []
         self._fault = ''
+        self._recoverable = False
 
-    def invalidate(self, reason):
-        """失去输入时正在执行的转弯锁存停车；需重启节点重新建立任务。"""
+    def invalidate(self, reason, recoverable=False):
+        """保留首次原因；硬异常可升级软故障，但不能反向降级。"""
         if self.phase == 'FAULT':
-            return  # 保留第一个故障原因，避免随后看门狗覆盖定位信息。
+            if self._recoverable and not recoverable:
+                self._fault += '；后续硬异常：'+reason
+            self._recoverable = self._recoverable and recoverable
+            return
         if self.phase != 'CRUISE':
             self.phase, self._fault = 'FAULT', reason
+            self._recoverable = recoverable
         else:
             self._axis_context, self._last_ns = None, None
             self._passed = []
 
     def _result(self, status, reason, **kwargs):
         return TurnResult(self.phase, status, reason, self.phase != 'CRUISE',
-                          exit_id=self._exit_id, **kwargs)
+                          exit_id=self._exit_id, recoverable=self._recoverable, **kwargs)
+
+    @property
+    def recovery_goal(self):
+        """只公开已确认道路出口，疑似墙端不能成为恢复转向目标。"""
+        if self.phase == 'CRUISE' or self._gate_world is None:
+            return None
+        return (tuple(self._gate_world), self._out_heading, self._exit_id)
+
+    def finish_recovery(self):
+        """恢复模块已验证整车越过入口且新道路对齐后，交还巡航。"""
+        if self.phase != 'CRUISE' and self._gate_world is not None:
+            self._passed.append((self._gate_world.copy(), self._out_heading))
+            self._passed = self._passed[-8:]
+        self.phase, self._path, self._exit_id = 'CRUISE', None, None
+        self._gate_world = self._out_heading = None
+        self._fault, self._recoverable = '', False
+        self._axis_context, self._last_ns = None, None
+        return self._result('OK', '局部恢复完成，交还巡航')
 
     def update(self, data, feedback, stamp_ns, corridor, exits, cruise_angle=None):
         cfg = self.config
@@ -218,12 +242,16 @@ class RightTurnBehavior:
             return self._result('TURN_FAULT', self._fault)
         if not feedback.valid or data.too_close.any() or not data.valid.any() \
                 or data.valid_ratio < self.planner.min_scan_finite_ratio:
-            self.invalidate('输入或运动反馈失效，不能沿历史路径继续转弯')
+            transient = (not feedback.valid and feedback.status in
+                         ('STALE_ODOM', 'UNALIGNED_ODOM', 'WAITING_ODOM')
+                         and not data.too_close.any() and data.valid.any()
+                         and data.valid_ratio >= self.planner.min_scan_finite_ratio)
+            self.invalidate('输入或运动反馈失效，不能沿历史路径继续转弯', transient)
             return self._result('TURN_FAULT' if self.phase == 'FAULT' else 'TURN_WAITING',
                                 '等待有效雷达和独立运动反馈')
         if self._last_ns is not None and (stamp_ns <= self._last_ns
                 or (stamp_ns-self._last_ns)*1e-9 > cfg.max_update_gap_s):
-            self.invalidate('转弯期间扫描重复、回跳或间隔过大，需重启后重新确认')
+            self.invalidate('转弯期间扫描重复、回跳或间隔过大', stamp_ns > self._last_ns)
             self._last_ns = stamp_ns
             return self._result('TURN_FAULT' if self.phase == 'FAULT' else 'TURN_WAITING',
                                 '扫描时间异常')
@@ -274,6 +302,9 @@ class RightTurnBehavior:
                 return self._result('TURN_APPROACH_WAITING', '接近道路参考过期，等待出口确认')
             if matching is not None and matching.state == 'CONFIRMED' \
                     and matching.observation.role == 'SIDE' and matching.observation.structural:
+                # 即使固定圆角无法接入，也可把这个已确认出口交给受限恢复行为。
+                self._gate_world = pose+np.asarray(matching.observation.center_xy) @ rot.T
+                self._out_heading = yaw+matching.observation.heading_rad
                 # 用当前车体坐标建立圆角，再一次性变换到 odom；之后不随出口抖动重画。
                 relative_axis = float(wrap_angle(axis-yaw))
                 center_error = (line_point-pose) @ np.array([-math.sin(axis), math.cos(axis)])
@@ -340,7 +371,7 @@ class RightTurnBehavior:
                                       -1/cfg.min_radius_m, 1/cfg.min_radius_m))
             heading = math.atan(curvature*cfg.lookahead_m/2)
         if (error > cfg.max_tracking_error_m or heading is None) and not new_corridor:
-            self.invalidate('偏离锁定路径或目标已到车后，停止并检查车辆转向标定')
+            self.invalidate('偏离锁定路径或目标已到车后，停止并检查车辆转向标定', True)
             return self._result('TURN_FAULT', self._fault, path_body=tuple(map(tuple, body_path)))
         reset_corridor = False
         if self.phase == 'APPROACH' and progress >= max(0, self._arc_start-2):

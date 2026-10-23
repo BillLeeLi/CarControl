@@ -14,12 +14,13 @@ import numpy as np
 from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import LaserScan
 
-from process_node.corridor import CorridorConfig, CorridorTracker
+from process_node.corridor import CorridorConfig, CorridorTracker, select_cruise_candidate
 from process_node.exits import ExitConfig, ExitTracker
 from process_node.motion import MotionConfig, MotionEstimator
 from process_node.perception import PlannerConfig, analyze_prepared_scan, prepare_scan
 from process_node.visualization import draw_laser
-from process_node.turning import RightTurnBehavior
+from process_node.turning import RightTurnBehavior, TurnResult
+from process_node.recovery import LocalRecoveryBehavior, RecoveryConfig
 
 
 def main():
@@ -30,7 +31,9 @@ def main():
     parser.add_argument('--scan-stride', type=int, default=1, help='每 N 帧扫描处理一帧，里程计不跳过')
     parser.add_argument('--output', type=Path, required=True, help='仓库外的结果目录')
     parser.add_argument('--turns', action='store_true', help='同时运行右转几何行为；不运行 PID、不发布控制')
+    parser.add_argument('--recovery', action='store_true', help='同时运行右转与局部恢复几何行为，不运行 PID')
     args = parser.parse_args()
+    args.turns = args.turns or args.recovery
     if not 0 < args.duration <= 120 or args.offset < 0 or args.scan_stride < 1:
         parser.error('duration 应在 (0, 120] 秒内，offset 应非负，scan-stride 应为正整数')
     args.output.mkdir(parents=True, exist_ok=True)
@@ -54,6 +57,8 @@ def main():
         tracker = ExitTracker(ExitConfig())
         motion = MotionEstimator(MotionConfig())
         turning = RightTurnBehavior(planner=planner)
+        recovery = LocalRecoveryBehavior(RecoveryConfig(), planner, turning.config) if args.recovery else None
+        recovery_states = Counter()
         turn_states = Counter()
         states, recommendations = Counter(), Counter()
         count, payload, last_picture = 0, 0, -1e9
@@ -65,7 +70,8 @@ def main():
             writer = csv.writer(file)
             writer.writerow(['bag_s', 'odom', 'corridor', 'exits', 'suggestion', 'preferred_id', 'tracks',
                              'scan_dt_s', 'fitted_walls', 'corridor_reason', 'yaw_deg',
-                             'behavior', 'turn_status', 'locked_exit', 'curvature', 'turn_reason'])
+                             'behavior', 'turn_status', 'locked_exit', 'curvature', 'turn_reason',
+                             'recovery_phase', 'recovery_status', 'recovery_reason', 'recovery_cause'])
             for timestamp, topic, blob in rows:
                 payload += len(blob)
                 received = (timestamp-start)*1e-9
@@ -76,6 +82,8 @@ def main():
                         corridor.reset()
                         tracker.reset()
                         turning.invalidate('独立里程计重建')
+                        if recovery is not None:
+                            recovery.interrupt('独立里程计重建', hard=True)
                     continue
                 seen_scans += 1
                 if (seen_scans-1) % args.scan_stride:
@@ -87,12 +95,32 @@ def main():
                 data = prepare_scan(scan, planner)
                 estimate = corridor.update(data, feedback, stamp)
                 result = tracker.update(data, feedback, stamp, estimate)
-                turn = turning.update(data, feedback, stamp, estimate, result,
-                                      estimate.target_angle_rad if estimate.usable else None) if args.turns else None
+                if recovery is not None and recovery.active and turning.phase == 'CRUISE':
+                    turn = TurnResult('CRUISE', 'OK', '局部恢复期间暂停新转弯选择')
+                else:
+                    turn = turning.update(data, feedback, stamp, estimate, result,
+                                          estimate.target_angle_rad if estimate.usable else None) if args.turns else None
                 if turn is not None:
                     turn_states[turn.phase+':'+turn.status] += 1
                     if turn.reset_corridor:
                         corridor.reset()
+                recovered = None
+                if recovery is not None:
+                    # 完整执行巡航候选门控，不能把未经安全检查的中线角当成可交接目标。
+                    plan = analyze_prepared_scan(data, planner, extra_headings=(
+                        (estimate.target_angle_rad,) if estimate.usable else ()))
+                    cruise = select_cruise_candidate(plan.candidates, estimate, corridor.config) \
+                        if estimate.usable and plan.status == 'OK' else None
+                    status = plan.status if plan.status != 'OK' else (
+                        'OK' if cruise is not None else 'CRUISE_BLOCKED' if estimate.usable else estimate.status)
+                    recovered = recovery.update(data, feedback, stamp, estimate,
+                                                None if cruise is None else cruise.angle,
+                                                status, turn, turning.recovery_goal, received_at=received)
+                    recovery_states[recovered.phase+':'+recovered.status] += 1
+                    if recovered.handoff:
+                        turning.finish_recovery()
+                    elif recovered.phase == 'MOVE' and turn.active:
+                        turning.invalidate('局部恢复接管', recoverable=True)
                 costs.append((time.perf_counter()-before)*1000)
                 descriptions = [dict(id=t.track_id, side=t.side, state=t.state,
                                      kind=t.observation.role,
@@ -111,24 +139,30 @@ def main():
                                  '' if turn is None else turn.phase, '' if turn is None else turn.status,
                                  '' if turn is None else turn.exit_id,
                                  '' if turn is None else turn.curvature_per_m,
-                                 '' if turn is None else turn.reason])
+                                 '' if turn is None else turn.reason,
+                                 '' if recovered is None else recovered.phase,
+                                 '' if recovered is None else recovered.status,
+                                 '' if recovered is None else recovered.reason,
+                                 '' if recovered is None else recovered.cause])
                 previous_stamp = stamp
                 count += 1
                 states[result.status] += 1
                 recommendations[result.recommendation] += 1
                 signature = (None if turn is None else (turn.phase, turn.status),
+                             None if recovered is None else (recovered.phase, recovered.status),
                              tuple((t.side, t.state) for t in result.tracks))
                 if received-last_picture >= 5 or (signature != previous_signature
                                                   and received-last_picture >= 1):
                     # 不显示成控制获准：该工具根本没有运行控制器。
                     plan = analyze_prepared_scan(data, planner)
                     picture = draw_laser(plan, planner, 'DIAGNOSTIC_ONLY', 0, 0,
-                                         'exit replay', corridor=estimate, exits=result, turn=turn)
+                                         'exit replay', corridor=estimate, exits=result, turn=turn, recovery=recovered)
                     cv2.imwrite(str(args.output/f'exits_{received:.2f}s.png'), picture)
                     last_picture = received
                 previous_signature = signature
         summary = dict(scans=count, scan_messages=seen_scans, payload_bytes=payload, status=dict(states),
                        suggestions=dict(recommendations), turns=dict(turn_states),
+                       recovery=dict(recovery_states),
                        perception_ms_median=float(np.median(costs)) if costs else None,
                        perception_ms_p95=float(np.percentile(costs, 95)) if costs else None,
                        note='独立 /scan，默认配置，未运行控制器；不能等同 AllSensor 实时控制或实车结果')

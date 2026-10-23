@@ -29,7 +29,8 @@ from process_node.pid_controller import PIDConfig, PIDController
 from process_node.perception import PlannerConfig, analyze_scan, analyze_prepared_scan, prepare_scan
 from process_node.visualization import draw_laser, draw_steering
 from process_node.window_monitor import create_window_monitor
-from process_node.turning import RightTurnBehavior, TurnConfig
+from process_node.turning import RightTurnBehavior, TurnConfig, TurnResult
+from process_node.recovery import LocalRecoveryBehavior, RecoveryConfig
 
 
 class LaserWindowAnalyzer(Node):
@@ -50,7 +51,7 @@ class LaserWindowAnalyzer(Node):
             }
         )
         self.declare_parameter("sensorTopic", "/sync_store_node/allsensor")
-        self.declare_parameter("group_label", "midterm-right-turn-v5")
+        self.declare_parameter("group_label", "midterm-recovery-v6")
         self.declare_parameter("show_visualization", True)
         self.declare_parameter("control_mode", "closed_loop")
         self.declare_parameter("reference_mode", "corridor")
@@ -120,6 +121,18 @@ class LaserWindowAnalyzer(Node):
         self.turning = RightTurnBehavior(turn_config, self.config,
                                          sensor_offset=self.exits.sensor_offset)
         self.last_turn = None
+        recovery_defaults = RecoveryConfig()
+        for item in fields(recovery_defaults):
+            self.declare_parameter('recovery_' + item.name, getattr(recovery_defaults, item.name))
+        recovery_config = RecoveryConfig(**{
+            item.name: self.get_parameter('recovery_' + item.name).value
+            for item in fields(recovery_defaults)
+        })
+        if recovery_config.speed_mps > pid_config.max_target_speed_mps:
+            raise ValueError('recovery 速度不能超过 max_target_speed_mps')
+        self.recovery = LocalRecoveryBehavior(recovery_config, self.config, turn_config,
+                                              self.exits.sensor_offset)
+        self.last_recovery = None
         self.declare_parameter("sensor_timeout_s", 1.0)
         self.declare_parameter("log_period_s", 1.0)
         self.steer_center = self.get_parameter("steer_center").value
@@ -254,7 +267,8 @@ class LaserWindowAnalyzer(Node):
                 and sensor_fresh):
             self.status = self.last_feedback.status
             self.previous_target = None
-            self._reset_corridor()
+            self._reset_corridor(recoverable=self.last_feedback.status in
+                                 ('STALE_ODOM', 'UNALIGNED_ODOM', 'WAITING_ODOM'))
             self.publish_stop()
             self.last_stop_time = now
             self.laser_image = None
@@ -273,7 +287,8 @@ class LaserWindowAnalyzer(Node):
         if expired is not None:
             self.status = expired
             self.previous_target = None
-            self._reset_corridor()
+            self._reset_corridor(recoverable=expired in
+                                 ('STALE_DATA', 'STALE_ODOM', 'UNALIGNED_ODOM'))
             self.last_command = self.controller.stop(expired, '发布前输入/反馈已过期')
             steer, speed = self.last_command.steer, self.last_command.speed
         self._publish(steer, speed)
@@ -300,12 +315,15 @@ class LaserWindowAnalyzer(Node):
                 corridor=self.last_corridor,
                 exits=self.last_exits,
                 turn=self.last_turn,
+                recovery=self.last_recovery,
             )
 
     def _log_decision(self):
         now = time.monotonic()
         log_status = (self.status, self.last_feedback.status,
-                      None if self.last_turn is None else (self.last_turn.phase, self.last_turn.status))
+                      None if self.last_turn is None else (self.last_turn.phase, self.last_turn.status),
+                      None if self.last_recovery is None else
+                      (self.last_recovery.phase, self.last_recovery.status))
         if (
             log_status == self.last_log_status
             and now - self.last_log_time < self.log_period
@@ -350,6 +368,11 @@ class LaserWindowAnalyzer(Node):
             control_text += (f' | behavior={turn.phase} turn_status={turn.status}'
                              f' locked_exit={turn.exit_id} curvature={turn.curvature_per_m:+.3f}/m'
                              f' ({turn.reason})')
+        if self.last_recovery is not None:
+            recovery = self.last_recovery
+            control_text += (f' | recovery={recovery.phase}/{recovery.status}'
+                             f' curvature={recovery.curvature_per_m:+.3f}/m'
+                             f' cause=({recovery.cause}) reason=({recovery.reason})')
         result = self.last_plan
         if self.last_corridor is not None:
             estimate = self.last_corridor
@@ -387,6 +410,8 @@ class LaserWindowAnalyzer(Node):
         target = result.target
         active_angle = target.angle if target is not None else (
             self.last_turn.heading_rad if self.last_turn is not None and self.last_turn.active else None)
+        if self.last_recovery is not None and self.last_recovery.active:
+            active_angle = self.last_recovery.heading_rad
         direction = "--" if active_angle is None else f"{math.degrees(active_angle):+.2f}deg"
         clearance = "--" if target is None else f"{target.clearance_m:.2f}m"
         support = "--" if target is None else f"{target.support_ratio:.0%}"
@@ -418,7 +443,7 @@ class LaserWindowAnalyzer(Node):
         if self.last_received is None or now - self.last_received > self.timeout:
             self.status = "WAITING" if self.last_received is None else "STALE_DATA"
             self.previous_target = None
-            self._reset_corridor()
+            self._reset_corridor(recoverable=True)
             if now - self.last_stop_time >= 0.2:
                 self.publish_stop()
                 self.last_stop_time = now
@@ -430,7 +455,8 @@ class LaserWindowAnalyzer(Node):
             if self.require_motion_feedback and not self.last_feedback.valid:
                 self.status = self.last_feedback.status
                 self.previous_target = None
-                self._reset_corridor()
+                self._reset_corridor(recoverable=self.last_feedback.status in
+                                     ('STALE_ODOM', 'UNALIGNED_ODOM', 'WAITING_ODOM'))
                 if now - self.last_stop_time >= 0.2:
                     self.publish_stop()
                     self.last_stop_time = now
@@ -474,6 +500,7 @@ class LaserWindowAnalyzer(Node):
                         corridor=self.last_corridor,
                         exits=self.last_exits,
                         turn=self.last_turn,
+                        recovery=self.last_recovery,
                     )
                 cv2.imshow(self.LASER_WINDOW, laser)
                 self.last_gui_signature, self.last_gui_time = signature, now
@@ -494,24 +521,29 @@ class LaserWindowAnalyzer(Node):
             except cv2.error:
                 pass
 
-    def _reset_corridor(self):
+    def _reset_corridor(self, recoverable=False, reason=None):
         self.corridor.reset()
         self.last_corridor = None
         self.exits.reset()
         self.last_exits = None
-        self.turning.invalidate('输入/反馈或扫描元数据失效，转弯已停止；重启后重新确认')
+        if reason is None:
+            reason = (f'输入/反馈异常({self.motion.status}/{self.last_feedback.status})，'
+                      + ('停车重新确认' if recoverable else '禁止自动沿用历史参考'))
+        self.turning.invalidate(reason, recoverable=recoverable)
+        self.recovery.interrupt(reason, hard=not recoverable)
         self.last_turn = None
+        self.last_recovery = None
 
     def _corridor_plan(self, urg, stamp_ns):
         """先生成运动补偿后的巡航参考，再由原感知检查实际可执行候选。"""
         try:
             data = prepare_scan(urg, self.config)
-        except (ValueError, TypeError, OverflowError):
-            self._reset_corridor()
+        except (ValueError, TypeError, OverflowError) as error:
+            self._reset_corridor(reason=f'扫描元数据无效：{error}')
             return analyze_scan(urg, self.config)
         if (data.too_close.any() or not data.valid.any()
                 or data.valid_ratio < self.config.min_scan_finite_ratio):
-            self._reset_corridor()
+            self._reset_corridor(reason='雷达过近、没有真实有限回波或真实回波比例不足')
             return analyze_prepared_scan(data, self.config)
         estimate = self.corridor.update(data, self.last_feedback, stamp_ns)
         self.last_corridor = estimate
@@ -537,7 +569,7 @@ class LaserWindowAnalyzer(Node):
         if self.last_stamp_ns is not None and stamp_ns < self.last_stamp_ns:
             self.previous_target = None
             self.controller.reset()
-            self._reset_corridor()
+            self._reset_corridor(reason='激光时间回跳，不能自动沿用历史位姿和路径')
             # 新一轮 odom 可能先于激光到达，只有仍留着旧时间段的反馈时才清空。
             if (self.motion.state is not None and self.motion.state.stamp_ns
                     > stamp_ns + round(self.motion.config.scan_tolerance_s * 1e9)):
@@ -567,12 +599,17 @@ class LaserWindowAnalyzer(Node):
         speed_scale = self.last_corridor.speed_scale \
             if self.reference_mode == 'corridor' and self.last_corridor is not None else 1.0
         requested_speed = self.target_speed_mps * speed_scale
+        cruise_angle, cruise_status = heading, self.last_plan.status
         reference_id = self.reference_mode
         reason = self.last_plan.reason
         if self.reference_mode == 'corridor':
-            self.last_turn = self.turning.update(
-                self.last_plan.scan, self.last_feedback, stamp_ns, self.last_corridor,
-                self.last_exits, cruise_angle=heading)
+            if self.recovery.active and self.turning.phase == 'CRUISE':
+                # 恢复过程中不另开新的路口任务；原已锁定出口仍由 turning 保留。
+                self.last_turn = TurnResult('CRUISE', 'OK', '局部恢复期间暂停新转弯选择')
+            else:
+                self.last_turn = self.turning.update(
+                    self.last_plan.scan, self.last_feedback, stamp_ns, self.last_corridor,
+                    self.last_exits, cruise_angle=heading)
             turn = self.last_turn
             if turn.reset_corridor:
                 # 仅重置拟合器；不能调用 _reset_corridor 取消正在执行的转弯。
@@ -584,8 +621,26 @@ class LaserWindowAnalyzer(Node):
                 # 曲线目标不伪装成经过直线筛选的 Candidate，图形使用独立路径字段。
                 self.last_plan = replace(self.last_plan, target=None,
                                          status=turn.status, reason=reason)
+            # 正常行为失败时才启用恢复；其候选独立检查曲线整车，不复用直线候选冒充转弯。
+            self.last_recovery = self.recovery.update(
+                self.last_plan.scan, self.last_feedback, stamp_ns, self.last_corridor,
+                cruise_angle, cruise_status, turn, self.turning.recovery_goal,
+                received_at=self.last_received)
+            recovery = self.last_recovery
+            if recovery.active:
+                heading, reason = recovery.heading_rad, recovery.reason
+                requested_speed = min(self.target_speed_mps, recovery.speed_mps)
+                reference_id = 'local_recovery'
+                self.last_plan = replace(self.last_plan, target=None,
+                                         status=recovery.status, reason=reason)
+                if recovery.handoff:
+                    self.last_turn = self.turning.finish_recovery()
+                elif recovery.phase == 'MOVE' and turn.active:
+                    # 开始局部修正后，不再追赶旧路径；保留出口意图与首次异常原因。
+                    self.turning.invalidate('旧转弯路径交给局部恢复重新检查', recoverable=True)
         else:
             self.last_turn = None
+            self.last_recovery = None
         reference = ControlReference(
             stamp_ns=stamp_ns,
             heading_error_rad=heading,

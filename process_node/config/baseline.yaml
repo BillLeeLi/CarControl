@@ -2,7 +2,7 @@
 /**:
   ros__parameters:
     sensorTopic: /sync_store_node/allsensor
-    group_label: midterm-right-turn-v5
+    group_label: midterm-recovery-v6
     show_visualization: true
     input_odom_queue_size: 200  # 独立接收线程的有界缓存；主线程先批量更新里程计
     visualization_period_s: 0.1  # 最多 10 Hz 刷新图像，窗口/按键事件仍持续处理
@@ -143,6 +143,25 @@
     turn_exit_center_tolerance_m: 0.30
     turn_exit_confirm_frames: 3
     turn_passed_exit_distance_m: 1.0
+    # 独立局部恢复：只在 corridor + closed_loop 的正常参考失效后接管。
+    # 先停车确认，再搜索朝可信道路/已确认出口前进的安全短弧；不向未知侧路盲转。
+    recovery_enabled: true
+    recovery_speed_mps: 0.06
+    recovery_stop_speed_mps: 0.05
+    recovery_confirm_frames: 3
+    recovery_confirm_time_s: 0.20
+    recovery_check_distance_m: 0.60
+    recovery_curvature_samples: 13
+    recovery_max_heading_deviation_deg: 65.0
+    recovery_guide_timeout_s: 1.0
+    recovery_guide_travel_m: 0.35
+    recovery_max_input_gap_s: 1.0
+    recovery_max_duration_s: 20.0
+    recovery_max_travel_m: 0.80
+    recovery_max_attempts: 3
+    recovery_normal_reset_time_s: 1.0
+    recovery_progress_timeout_s: 4.0
+    recovery_min_progress_m: 0.03
     steer_center: 0
     steer_limit: 600
     # 以下两项仅在 control_mode=baseline 时使用。

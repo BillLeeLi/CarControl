@@ -71,14 +71,15 @@ def test_curved_path_obstruction_overrides_controller_then_resumes_same_exit(nod
     assert node.status == 'CONTROL_WARMUP'
 
 
-def test_watchdog_latches_fault_for_an_active_turn(node):
+def test_watchdog_stops_active_turn_and_allows_only_confirmed_local_recovery(node):
     approach(node)
     node.last_received = time.monotonic()-node.timeout-1
     node._tick()
     assert node.speed_value == node.stop_speed
     tick_branch(node, 100.6)
     assert node.last_turn.phase == 'FAULT'
-    assert node.status == 'TURN_FAULT'
+    assert node.last_turn.recoverable
+    assert node.status == 'RECOVERY_WAITING'
     assert node.speed_value == node.stop_speed
 
 

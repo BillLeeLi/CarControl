@@ -28,6 +28,7 @@
 │   ├── corridor.py
 │   ├── exits.py
 │   ├── turning.py
+│   ├── recovery.py
 │   ├── input_buffer.py
 │   ├── motion.py
 │   ├── control.py
@@ -140,11 +141,12 @@ ros2 launch process_node process_node.launch.py config:=src/process_node/config/
 
 ### 当前配置中需要记住的内容
 
-- 当前标签 `midterm-right-turn-v5`，默认 `closed_loop + corridor`，巡航目标 0.2 m/s，右转接近/转弯/对齐上限 0.1 m/s。首次直路标定可在 YAML 中设置 `turn_enabled: false`、较低的 `target_speed_mps`；中位/速度测试用 `reference_mode: straight`。
+- 当前标签 `midterm-recovery-v6`，默认 `closed_loop + corridor`，巡航目标 0.2 m/s，右转上限 0.1 m/s，局部恢复默认开启、上限 0.06 m/s。首次直路标定可设 `turn_enabled: false`、`recovery_enabled: false` 和较低目标速度；中位/速度测试用 `reference_mode: straight`。
 - 实测尺寸为宽 0.22 m、雷达到车头 0.16 m、到车尾 0.26 m，安全裕量保持 0.10 m。旧的现场专用 YAML 可能仍覆盖为旧尺寸，应核对。
 - 前后距离统一相对雷达定义，转弯矩形按 `corridor_sensor_x_m/y_m` 转到 base_link；实际安装平移仍未确认。控制中位、符号、增益、动力死区、最小转弯半径和停车能力仍需实车标定，不能由车体尺寸推定。
 - 当前能执行走廊巡航和单个右转；左转、短 Z 衔接、S 弯绕障和终点判断未完成。具体参数和图例见 [README.md](README.md)。
-- `TURN_BLOCKED` 保留路径停车等待；`TURN_FAULT` 锁存停车，先记录原因、排查并确认车辆位置，再重启节点重新建立任务。不要仅通过放宽时间/路径门控解除故障。
+- `TURN_BLOCKED` 先停车；参考/旧路径问题可进入局部恢复，经停车、低速反馈和安全短弧连续确认后才动作。图中 `RECOVERY/阶段` 和日志 `recovery/cause/reason` 表示恢复正在仲裁；原 `turn_status=TURN_FAULT` 不一定仍要求永久停车，应结合恢复结果看。
+- `RECOVERY_NO_GUIDE` / `RECOVERY_BLOCKED` 表示缺少可信方向或安全短弧，继续停车。`RECOVERY_COMPLETE` 连续确认交回巡航；不可恢复的 `TURN_FAULT` 和 `RECOVERY_FAULT` 仍需记录原因、人工检查后重启。不要通过放宽时间/路径门控解除故障。`recovery_enabled: false` 可关闭新增行为，其他启动命令不变。
 
 ## 5. 依赖前提和干净容器验证范围
 
@@ -165,7 +167,7 @@ ros2 launch process_node process_node.launch.py config:=src/process_node/config/
 1. 编译、导入、launch、无输入等待及正常退出：不需要小车或 bag；无输入停车是预期结果。
 2. 接收传感器、计算控制、窗口更新及超时停车：需要另外提供课程 bag 或实车输入。干净容器的结果不能代替车辆控制响应标定。
 
-已有本地验证：尺寸修订已构建成功，通过 **263 项功能测试**。此前真实两窗口回放观察到完整单右转行为交接。**尚未按本次 U 盘流程在新建干净容器或助教设备上重新验证**；验证后应把镜像、依赖差异、工作区路径和结果回填本文。详细历史回放记录保留在 README，避免现场操作文档过长。
+已有本地验证：当前 v6 已构建成功，通过 **302 项功能测试**，含局部恢复及软故障交回巡航；有界小消息与真实双窗口回放检查通过，后者未执行恢复动作。此前 v5 两窗口回放观察到完整单右转交接。**尚未按本次 U 盘流程在新建干净容器或助教设备上重新验证**；验证后应把镜像、依赖差异、工作区路径和结果回填本文。具体帧数、能力和限制保留在 README，避免现场操作文档过长。
 
 ---
 
@@ -208,7 +210,7 @@ ros2 param get /process_node/process_node steer_kp
 - `WAITING` / `WAITING_ODOM`：先检查设备节点和输入，不是靠增大增益解决。
 - `UNALIGNED_ODOM` / `STALE_ODOM`：看消息时间、接收和 skew，实车 use_sim_time 应为 false；不先放宽对齐容差。
 - `CORRIDOR_ACQUIRING` / `CORRIDOR_LOST`：查看真实墙面和模型是否可靠；`CRUISE_BLOCKED` 表示参考附近没有合格候选。
-- `TURN_FAULT`：保留终端中的具体原因，不能只依据截图认定道路太窄。
+- `TURN_FAULT`：结合 `recovery` 看是否为可恢复路径问题；`RECOVERY_FAULT` 或硬转弯故障保持停车。保留首次 cause 和当前 reason，不能只依据截图认定道路太窄。
 - 没有图形桌面时，显式使用 `show_visualization:=false`；有桌面却没窗口时检查 DISPLAY 和启动日志。不要把某次 DISPLAY/XAUTHORITY 固定写入 ~/.bashrc；VS Code 转发异常时重新连接或重启容器。详见 README。
 - `speed` 是底层动力控制量，不是 m/s。PI 输出很小或为零时，查看目标/实测速度、动力符号和死区，不直接增大积分。
 
@@ -250,7 +252,8 @@ python3 -m pytest src/process_node/test/test_perception.py \
   src/process_node/test/test_corridor.py src/process_node/test/test_node_corridor.py \
   src/process_node/test/test_input_buffer.py \
   src/process_node/test/test_exits.py src/process_node/test/test_node_exits.py \
-  src/process_node/test/test_turning.py src/process_node/test/test_node_turning.py -q
+  src/process_node/test/test_turning.py src/process_node/test/test_node_turning.py \
+  src/process_node/test/test_recovery.py src/process_node/test/test_node_recovery.py -q
 ```
 
 ### B.4 录制数据离线回放
@@ -268,6 +271,8 @@ ros2 bag play /data/data_whole/rosbag2_2026_10_06-18_13_20 --clock
 ```
 
 无桌面时在终端一增加 `show_visualization:=false`。回放不会响应当前控制改变下一帧数据，不能证明实车转弯成功。课程 bag 后段 AllSensor 存在长间隔/成批到达，可能触发时间保护；保持已有阈值。重新从头播放时也应重启控制节点。
+
+恢复开始修正前要求实测速度不高于 0.05 m/s；回放中的原车可能持续行驶，导致恢复等待或累计路程超限，这是录制输入不会响应本次停车指令的限制。不能通过放宽保护来追求回放控制连续。无新增依赖/话题/启动参数；U 盘需包含 recovery.py，仍只拷贝整个 process_node 并按原步骤编译。新建干净容器的迁移验证仍待用户执行。
 
 ### B.5 实车短段录制
 
