@@ -151,7 +151,7 @@
     stop_speed: 0
     # 方向误差以 rad 计，控制符号与增益分开配置。
     steer_sign: -1
-    steer_kp: 300.0
+    steer_kp: 3000.0
     steer_kd: 30.0
     steer_derivative_tau_s: 0.15
     steer_jump_reset_deg: 20.0

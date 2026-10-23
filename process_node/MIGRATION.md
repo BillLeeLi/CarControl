@@ -37,6 +37,7 @@
 ├── tools/
 ├── test/
 ├── README.md
+├── TUNING.md
 └── MIGRATION.md
 ```
 
@@ -134,6 +135,8 @@ ros2 launch process_node process_node.launch.py config:=src/process_node/config/
 ```
 
 两种方式都在启动时读取参数；保存文件后，正在运行的节点不会自动应用新值。
+
+现场核心参数的含义、调试顺序、调整方向和故障判断见 [TUNING.md](TUNING.md)。其中数值以当前 YAML 为准，特别注意当前 `steer_kp=3000.0` 与 Python 内置默认值 `300.0` 不同；本包 launch 会加载 YAML。
 
 ### 当前配置中需要记住的内容
 

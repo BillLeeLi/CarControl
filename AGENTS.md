@@ -42,6 +42,7 @@
 | `process_node/process_node/window_monitor.py` | 窗口关闭识别，兼容 GTK3 不支持 OpenCV 可见性属性的情况 |
 | `process_node/config/baseline.yaml`、`process_node/README.md` | 感知基线参数、运行和图例说明 |
 | `process_node/MIGRATION.md` | 迁移到助教设备、依赖与构建、实车启动及故障排查 |
+| `process_node/TUNING.md` | 核心参数含义、现场调试顺序、调整方向与生效方式；参数变化时同步核对 |
 | `process_node/process_node/process_node_bk.py` | 镜像附带的另一版本，含额外依赖，不作为默认入口 |
 | `process_node/launch/process_node.launch.py` | 启动控制节点，并设置 `/process_node` 命名空间 |
 | `process_node/setup.py`、`setup.cfg` | 注册可执行入口和安装路径 |

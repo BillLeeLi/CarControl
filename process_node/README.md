@@ -355,7 +355,9 @@ ros2 launch process_node process_node.launch.py use_sim_time:=true show_visualiz
 
 ## 主要参数
 
-全部默认值见 `config/baseline.yaml`；直接 `ros2 run` 的内置默认值与其一致。车体尺寸来自 2026-10-23 用户测量，其余默认阈值和控制参数仍为离线调试起点。
+现场调试顺序、参数调整方向和生效方式见 [TUNING.md](TUNING.md)。
+
+launch 使用 `config/baseline.yaml`；直接 `ros2 run` 且不传参数文件时使用 Python 内置默认值。当前 YAML 的 `steer_kp=3000.0`，内置值为 `300.0`，其他参数也应以实际加载配置为准。车体尺寸来自 2026-10-23 用户测量，其余阈值和控制参数仍需实车标定。
 
 | 参数 | 含义 |
 |---|---|
